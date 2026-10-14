@@ -1,25 +1,30 @@
 """
-Deteksi Jalur Jalan Lurus & Belok - Webcam / Video / Foto
-=========================================================
+Deteksi Jalur Jalan Lurus & Belok - Webcam / Video / Foto  (versi 3)
+====================================================================
 Alur:
-  Input -> Grayscale -> Gaussian Blur -> Canny -> ROI -> HoughLinesP
-  -> klasifikasi kiri/kanan (gating) -> fit kurva berbobot -> EMA
-  -> arah belok (hysteresis) & offset
-  -> finalize_lanes(): koordinat FINAL dengan fallback
+  Input -> Grayscale -> [CLAHE opsional] -> Gaussian Blur -> Canny -> ROI
+  -> filter kecerahan -> HoughLinesP -> klasifikasi kiri/kanan (gating)
+  -> fit kurva: ridge + buang outlier (RANSAC opsional) -> EMA
+  -> validasi lebar jalur -> koordinat FINAL dengan fallback
      (deteksi / turunan / estimasi / hilang)
-  -> output JSON Lines (--koordinat)
+  -> Kalman filter pada tiap titik koordinat
+  -> gambar + angka koordinat + output JSON Lines (--koordinat)
 
 Cara pakai:
   python deteksi_jalan_belok_webcam.py --source 0
   python deteksi_jalan_belok_webcam.py --source video_jalan.mp4 --koordinat koordinat.jsonl
-  python deteksi_jalan_belok_webcam.py --source jalan.jpg --stages
+  python deteksi_jalan_belok_webcam.py --source jalan.jpg --stages --koordinat koordinat.jsonl
 
-Tombol: q = keluar | d = debug | s = snapshot | p = hasil per tahap
+Pembanding (untuk laporan / presentasi):
+  --tanpa-kalman  --tanpa-validasi-lebar  --ransac  --clahe  --tanpa-angka
+
+Tombol: q = keluar | d = debug | c = angka koordinat on/off
+        s = snapshot | p = hasil per tahap
 """
 
 import argparse
 import copy       # deepcopy state (hasil per tahap pada video)
-import json       # menulis koordinat ke file JSON Lines
+import json       # menulis koordinat ke file JSON
 import os         # membuat folder penyimpanan
 import threading  # membaca kamera di thread terpisah (anti-delay)
 import time       # pengatur kecepatan video & hitung FPS
@@ -31,7 +36,10 @@ import numpy as np
 # ============================ PARAMETER ============================
 PROCESS_WIDTH = 640
 
-# --- Grayscale -> Gaussian Blur -> Canny
+# --- Pra-pemrosesan: Grayscale -> [CLAHE] -> Gaussian Blur -> Canny
+USE_CLAHE = False                  # True = perkuat kontras marka pudar (opsi --clahe)
+CLAHE_CLIP = 2.0
+CLAHE_TILE = 8
 BLUR_KSIZE = 5                     # harus ganjil (3, 5, 7, ...)
 CANNY_LOW, CANNY_HIGH = 50, 150
 
@@ -50,7 +58,8 @@ BRIGHT_FRACTION = 0.4
 BRIGHT_DILATE = 7
 
 # --- Gating & fit
-GATE_TOL = 0.07
+GATE_TOL = 0.07                    # toleransi gating saat garis baru hilang / belum stabil
+GATE_TOL_STABIL = 0.04             # toleransi lebih ketat saat garis stabil (menolak garis pengganggu)
 MIN_LANE_GAP = 0.12
 MAX_LANE_GAP = 0.0                 # 0 = nonaktif
 Y_HORIZON = 0.48                   # tinggi cakrawala (proporsi tinggi gambar)
@@ -62,8 +71,15 @@ CURVE_MIN_SPAN = 0.10
 NOISE_FRAC = 0.006
 CURVE_PRIOR_FRAC = 0.030
 
-# --- Smoothing filter (EMA)
-ALPHA = 0.30
+# --- RANSAC (fit tahan outlier). Default MATI: pada uji sintetis hasilnya campur
+#     (kadang membantu, kadang tidak). Aktifkan dengan --ransac bila ingin dicoba.
+USE_RANSAC = False
+RANSAC_ITER = 40                   # jumlah percobaan model acak
+RANSAC_THR_FRAC = 0.014            # toleransi titik dianggap "cocok" (proporsi lebar gambar)
+RANSAC_MAX_CURVE = 0.08            # kelengkungan maksimum yang masuk akal (proporsi lebar)
+
+# --- Smoothing EMA pada parameter garis (tahap awal)
+ALPHA = 0.35
 MAX_JUMP = 0.08
 RELOCK_AFTER = 6
 MAX_MISSING = 15
@@ -86,7 +102,29 @@ DECAY = 0.90                       # pelemahan tren saat estimasi (0-1)
 LEBAR_PROP_DEFAULT = 0.45          # tebakan awal lebar jalur (proporsi lebar gambar di Y_REF)
 LEBAR_ALPHA = 0.10                 # kecepatan kalibrasi lebar jalur (EMA)
 Y_LEVELS = np.linspace(Y_TOP, Y_BOTTOM, N_TITIK)
+
+# --- Kalman filter (smoothing tahap akhir pada tiap titik koordinat)
+USE_KALMAN = True
+KF_Q_POS = 0.0015                  # ketidakpastian proses posisi (proporsi lebar) per frame
+KF_Q_VEL = 0.0004                  # ketidakpastian proses kecepatan (proporsi lebar)
+KF_VEL_DECAY = 0.90                # kecepatan diredam tiap frame (0-1)
+KF_R_DETEKSI = 0.004               # derau ukur saat deteksi langsung (proporsi lebar)
+KF_R_TURUNAN = 0.012               # derau ukur saat garis diturunkan dari sisi lain
+KF_R_ESTIMASI = 0.030              # derau ukur saat estimasi dari riwayat
+KF_GATE = 3.0                      # ukuran loncatan (x sigma) sebelum ukuran dicurigai
+
+# --- Validasi lebar jalur (konsistensi geometri kiri-kanan)
+VALIDASI_LEBAR = True
+LEBAR_TOL = 0.30                   # lebar baru boleh menyimpang +-30% dari lebar terkalibrasi
+LEBAR_N_MIN = 8                    # jumlah pasangan valid sebelum lebar dianggap terkalibrasi
+LEBAR_BAD_MAX = 25                 # frame tidak konsisten berturut-turut sebelum kalibrasi diulang
+LEBAR_WIN_MIN, LEBAR_WIN_MAX = 0.55, 1.60   # jendela posisi garis yang baru dicari
+
+# --- Tampilan angka koordinat pada gambar
+SHOW_COORDS = True
 # ===================================================================
+
+_RNG = np.random.default_rng(12345)   # acak tetap -> hasil RANSAC bisa diulang
 
 
 # ------------------------------------------------------------------ model garis
@@ -123,15 +161,72 @@ def _arah_ok(fit, side):
     return fit
 
 
+def _ransac_inliers(t, xs, w, prior=None):
+    """RANSAC: coba banyak model (garis / parabola) dari 3 titik acak yang
+    tersebar di bagian bawah, tengah, dan atas data. Model dengan titik 'cocok'
+    terbanyak menang; model yang dekat dengan garis frame lalu diberi bonus.
+    Mengembalikan mask boolean titik inlier."""
+    n = len(t)
+    thr = RANSAC_THR_FRAC * w
+    order = np.argsort(t)
+    groups = np.array_split(order, 3)
+    if any(len(g) == 0 for g in groups):
+        return np.ones(n, dtype=bool)
+    t_top = Y_TOP - Y_BOTTOM
+    max_a = RANSAC_MAX_CURVE * w / (t_top ** 2)
+
+    r = _RNG.random((RANSAC_ITER, 3))
+    pick = [groups[k][(r[:, k] * len(groups[k])).astype(int)] for k in range(3)]
+    t_mid = float(t.mean())
+    best_mask, best_score = None, -1.0
+
+    for it in range(RANSAC_ITER):
+        i0, i1, i2 = pick[0][it], pick[1][it], pick[2][it]
+        ta, tb, tc = t[i0], t[i1], t[i2]
+        xa, xb, xc = xs[i0], xs[i1], xs[i2]
+        if it % 2 == 0:                       # model garis lurus (A = 0)
+            dt = tc - ta
+            if abs(dt) < 1e-3:
+                continue
+            a = 0.0
+            b = (xc - xa) / dt
+            c = xa - b * ta
+        else:                                 # model parabola
+            m = np.array([[ta * ta, ta, 1.0], [tb * tb, tb, 1.0], [tc * tc, tc, 1.0]])
+            try:
+                a, b, c = np.linalg.solve(m, np.array([xa, xb, xc]))
+            except np.linalg.LinAlgError:
+                continue
+            if abs(a) > max_a:                # kelengkungan tidak masuk akal
+                continue
+        mask = np.abs(xs - (a * t * t + b * t + c)) < thr
+        score = float(mask.sum())
+        if prior is not None:                 # bonus: konsisten dengan frame lalu
+            px = prior[0] * t_mid ** 2 + prior[1] * t_mid + prior[2]
+            mx = a * t_mid ** 2 + b * t_mid + c
+            if abs(px - mx) < 3 * thr:
+                score += 0.3 * n
+        if score > best_score:
+            best_score, best_mask = score, mask
+    return best_mask if best_mask is not None else np.ones(n, dtype=bool)
+
+
 def fit_lane(xs, ys, w, h, side=None, prior=None):
-    """Fit x = A t^2 + B t + C berbobot ridge + buang pencilan.
+    """Fit x = A t^2 + B t + C: RANSAC -> ridge berbobot -> buang pencilan (MAD).
     Mengembalikan (theta, domain) atau None kalau data tidak cukup."""
     xs = np.asarray(xs, dtype=np.float64)
     ys = np.asarray(ys, dtype=np.float64)
     if len(xs) < MIN_SAMPLES:
         return None
     t = to_t(ys, h)
-    span = t.max() - t.min()
+
+    keep = np.ones(len(xs), dtype=bool)
+    if USE_RANSAC and len(xs) >= 2 * MIN_SAMPLES:
+        k = _ransac_inliers(t, xs, w, prior)
+        if k.sum() >= MIN_SAMPLES:
+            keep = k
+
+    span = t[keep].max() - t[keep].min()     # rentang vertikal titik yang dipercaya
     if span < MIN_SPAN:
         return None
     use_curve = span >= CURVE_MIN_SPAN
@@ -140,15 +235,15 @@ def fit_lane(xs, ys, w, h, side=None, prior=None):
     # garis lama, hanya posisi (C) yang dicari.
     if prior is not None and span < SHORT_SPAN:
         A0, B0 = float(prior[0]), float(prior[1])
-        c = float(np.median(xs - (A0 * t ** 2 + B0 * t)))   # median: kebal pencilan
-        fit = (np.array([A0, B0, c]), (float(t.min()), float(t.max())))
+        tk = t[keep]
+        c = float(np.median(xs[keep] - (A0 * tk ** 2 + B0 * tk)))
+        fit = (np.array([A0, B0, c]), (float(tk.min()), float(tk.max())))
         return _arah_ok(fit, side)
 
     t_top = Y_TOP - Y_BOTTOM
     sigma_a = CURVE_PRIOR_FRAC * w / (t_top ** 2)
     ridge = (NOISE_FRAC * w / sigma_a) ** 2
 
-    keep = np.ones(len(xs), dtype=bool)
     best = None
     for _ in range(3):                       # maksimal 3 putaran buang outlier
         tt, xx = t[keep], xs[keep]
@@ -172,6 +267,63 @@ def fit_lane(xs, ys, w, h, side=None, prior=None):
     return _arah_ok(best, side)
 
 
+class KalmanLevels:
+    """Kalman filter (model kecepatan-konstan) untuk N titik posisi x sekaligus.
+    Tiap titik punya state [posisi, kecepatan]. Derau ukur (r_std) boleh beda
+    untuk tiap titik dan tiap frame: ukuran yang tidak pasti -> dipercaya sedikit."""
+
+    def __init__(self, n):
+        self.n = n
+        self.aktif = False
+        self.x = self.v = None
+        self.p00 = self.p01 = self.p10 = self.p11 = None
+
+    def reset(self):
+        self.aktif = False
+
+    def langkah(self, z, r_std, w, decay=None):
+        """z = ukuran posisi (N,), r_std = simpangan baku ukur dalam pixel (N,).
+        decay = peredaman kecepatan (None -> KF_VEL_DECAY). Mengembalikan posisi halus."""
+        d = KF_VEL_DECAY if decay is None else decay
+        z = np.asarray(z, dtype=np.float64)
+        r = np.asarray(r_std, dtype=np.float64) ** 2
+        qx = (KF_Q_POS * w) ** 2
+        qv = (KF_Q_VEL * w) ** 2
+
+        if not self.aktif:                   # inisialisasi dari ukuran pertama
+            self.x = z.copy()
+            self.v = np.zeros(self.n)
+            self.p00 = r.copy()
+            self.p01 = np.zeros(self.n)
+            self.p10 = np.zeros(self.n)
+            self.p11 = np.full(self.n, (5.0 * KF_Q_VEL * w) ** 2)
+            self.aktif = True
+            return self.x.copy()
+
+        # --- prediksi: x' = x + v ; v' = d*v ; P' = F P F^T + Q
+        x = self.x + self.v
+        v = d * self.v
+        p00 = self.p00 + self.p01 + self.p10 + self.p11 + qx
+        p01 = d * (self.p01 + self.p11)
+        p10 = d * (self.p10 + self.p11)
+        p11 = d * d * self.p11 + qv
+
+        # --- koreksi (dengan penjaga loncatan: ukuran aneh -> derau diperbesar)
+        y = z - x
+        s0 = p00 + r
+        infl = np.maximum(1.0, y * y / (KF_GATE ** 2 * s0))
+        s = p00 + r * infl
+        k0 = p00 / s
+        k1 = p10 / s
+        self.x = x + k0 * y
+        self.v = v + k1 * y
+        self.p00 = (1.0 - k0) * p00
+        self.p01 = (1.0 - k0) * p01
+        self.p10 = p10 - k1 * p00
+        self.p11 = p11 - k1 * p01
+        return self.x.copy()
+
+
 class LaneTrack:
     """Satu sisi garis + smoothing EMA + tolak lompatan + persistensi."""
 
@@ -181,6 +333,12 @@ class LaneTrack:
         self.missing = 0       # frame berturut-turut gagal
         self.rejects = 0       # penolakan lompatan berturut-turut
         self.fresh = False     # True jika frame INI diterima dari deteksi
+
+    def reset(self):
+        """Buang garis ini (misalnya karena tidak konsisten dengan lebar jalur)."""
+        self.theta, self.dom = None, None
+        self.missing, self.rejects = 0, 0
+        self.fresh = False
 
     def x_at(self, y, h):
         """Posisi x garis pada ketinggian y."""
@@ -232,6 +390,7 @@ class LaneState:
         self.bend = 0.0
         self.arah = "Lurus"
         self.debug = False
+        self.show_coords = SHOW_COORDS
         # riwayat & status untuk fallback
         self.kiri_hist = deque(maxlen=HIST_LEN)
         self.kanan_hist = deque(maxlen=HIST_LEN)
@@ -239,16 +398,43 @@ class LaneState:
         self.kanan_hold = 0            # frame sejak deteksi kanan terakhir
         self.lebar_prop = LEBAR_PROP_DEFAULT
         self.lebar_terkalibrasi = False
+        self.lebar_n = 0               # jumlah pasangan valid yang sudah dipakai kalibrasi
+        self.lebar_bad = 0             # frame berturut-turut lebar tidak konsisten
+        self.prev_ref = None           # (x kiri, x kanan) di Y_REF frame sebelumnya
         self.frame_idx = 0
+        # Kalman filter untuk koordinat final
+        self.kf_kiri = KalmanLevels(N_TITIK)
+        self.kf_kanan = KalmanLevels(N_TITIK)
 
 
 # ------------------------------------------------------------------ tahap pipeline
+_CLAHE = None
+
+
+def _get_clahe():
+    global _CLAHE
+    if _CLAHE is None:
+        _CLAHE = cv2.createCLAHE(clipLimit=CLAHE_CLIP,
+                                 tileGridSize=(CLAHE_TILE, CLAHE_TILE))
+    return _CLAHE
+
+
 def preprocess(frame):
-    """Grayscale -> Gaussian Blur -> Canny. Mengembalikan ketiga hasilnya."""
+    """Grayscale -> [CLAHE] -> Gaussian Blur -> Canny.
+    Mengembalikan (gray, eq, blur, edges, blur_raw):
+      eq       = gray setelah CLAHE (sama dengan gray bila CLAHE mati)
+      blur     = blur dari eq (dipakai Canny)
+      blur_raw = blur dari gray asli (dipakai filter kecerahan)"""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (BLUR_KSIZE, BLUR_KSIZE), 0)
+    k = (BLUR_KSIZE, BLUR_KSIZE)
+    blur_raw = cv2.GaussianBlur(gray, k, 0)
+    if USE_CLAHE:
+        eq = _get_clahe().apply(gray)
+        blur = cv2.GaussianBlur(eq, k, 0)
+    else:
+        eq, blur = gray, blur_raw
     edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
-    return gray, blur, edges
+    return gray, eq, blur, edges, blur_raw
 
 
 _ROI_CACHE = {}
@@ -278,12 +464,18 @@ def sample_segment(x1, y1, x2, y2, step=6.0):
     return np.linspace(x1, x2, n), np.linspace(y1, y2, n)
 
 
-def collect_segments(lines, w, h, left, right, bright=None):
-    """Pisahkan segmen Hough ke kiri/kanan (dengan gating)."""
+def collect_segments(lines, w, h, left, right, bright=None, lebar_prop=None):
+    """Pisahkan segmen Hough ke kiri/kanan (dengan gating).
+    lebar_prop (bila sudah terkalibrasi) dipakai untuk mencari garis yang sedang
+    hilang di jarak lebar jalur dari garis yang masih ada."""
     L, R = ([], []), ([], [])
     if lines is None:
         return L, R
-    tol = GATE_TOL * w
+
+    def tol_of(track):
+        """Gating adaptif: ketat jika garis stabil, longgar jika baru hilang/ditolak."""
+        stabil = track.missing == 0 and track.rejects == 0
+        return (GATE_TOL_STABIL if stabil else GATE_TOL) * w
 
     for x1, y1, x2, y2 in lines.reshape(-1, 4):
         dx, dy = x2 - x1, y2 - y1
@@ -306,6 +498,7 @@ def collect_segments(lines, w, h, left, right, bright=None):
 
         def near(track):
             """True jika kedua ujung segmen dekat dengan garis track."""
+            tol = tol_of(track)
             return all(abs(x - track.x_at(y, h)) < tol for x, y in ends)
 
         if left.theta is not None or right.theta is not None:
@@ -331,6 +524,18 @@ def collect_segments(lines, w, h, left, right, bright=None):
                     xm > left.x_at(ym, h) + MAX_LANE_GAP * w * \
                     max(ym / h - Y_HORIZON, 0.01) / (Y_REF - Y_HORIZON):
                 side = None
+
+            # jendela lebar jalur: hanya saat sebuah garis SEDANG dicari ulang
+            if lebar_prop is not None:
+                lw = float(lebar_jalur(ym, h, w, lebar_prop))
+                if side == "R" and right.theta is None and left.theta is not None:
+                    xlm = left.x_at(ym, h)
+                    if not (xlm + LEBAR_WIN_MIN * lw < xm < xlm + LEBAR_WIN_MAX * lw):
+                        side = None
+                if side == "L" and left.theta is None and right.theta is not None:
+                    xrm = right.x_at(ym, h)
+                    if not (xrm - LEBAR_WIN_MAX * lw < xm < xrm - LEBAR_WIN_MIN * lw):
+                        side = None
         else:
             side = (
                 "L" if (slope < 0 and xm < 0.62 * w)
@@ -459,16 +664,16 @@ def detect_lanes(frame, state):
     """Tahap deteksi jalur (mentah, dari gambar)."""
     h, w = frame.shape[:2]
 
-    gray, blur, edges = preprocess(frame)
+    gray, eq, blur, edges, blur_raw = preprocess(frame)
 
     poly, roi_mask = get_roi(w, h)
     roi_edges = apply_roi(edges, roi_mask)
 
     bright = None
     if BRIGHT_DELTA > 0:
-        med = float(np.median(blur[roi_mask > 0]))
+        med = float(np.median(blur_raw[roi_mask > 0]))
         bright = cv2.dilate(
-            (blur > med + BRIGHT_DELTA).astype(np.uint8),
+            (blur_raw > med + BRIGHT_DELTA).astype(np.uint8),
             _BRIGHT_KERNEL
         ) > 0
         roi_edges = roi_edges * bright.astype(np.uint8)
@@ -478,7 +683,8 @@ def detect_lanes(frame, state):
         minLineLength=HOUGH_MIN_LEN, maxLineGap=HOUGH_MAX_GAP
     )
 
-    Lp, Rp = collect_segments(lines, w, h, state.left, state.right, bright)
+    lebar_prop = state.lebar_prop if state.lebar_terkalibrasi else None
+    Lp, Rp = collect_segments(lines, w, h, state.left, state.right, bright, lebar_prop)
 
     state.left.update(fit_lane(Lp[0], Lp[1], w, h, "L", state.left.theta), w, h)
     state.right.update(fit_lane(Rp[0], Rp[1], w, h, "R", state.right.theta), w, h)
@@ -489,7 +695,7 @@ def detect_lanes(frame, state):
 
 
 # ================================================================
-#   KOORDINAT OUTPUT + FALLBACK
+#   KOORDINAT OUTPUT + FALLBACK + KALMAN
 # ================================================================
 def xs_di_level(track, h):
     """Posisi x garis di setiap level output (array sepanjang N_TITIK)."""
@@ -504,20 +710,36 @@ def lebar_jalur(y_px, h, w, lebar_prop):
     return lebar_prop * w * np.maximum(frac, 0.02)
 
 
-def kalibrasi_lebar(state, w, h):
-    """Ukur lebar jalur dari dua garis yang terdeteksi bersamaan, lalu haluskan (EMA)."""
-    xl = state.left.x_at(Y_REF * h, h)
-    xr = state.right.x_at(Y_REF * h, h)
-    if xl is None or xr is None:
-        return
-    prop = (xr - xl) / w
-    if not (0.15 < prop < 0.9):
-        return
-    if state.lebar_terkalibrasi:
-        state.lebar_prop = (1 - LEBAR_ALPHA) * state.lebar_prop + LEBAR_ALPHA * prop
-    else:
-        state.lebar_prop = prop
-        state.lebar_terkalibrasi = True
+def _lebar_konsisten(state, prop):
+    """Apakah lebar pasangan garis (proporsi lebar gambar) masuk akal dan
+    sesuai dengan lebar jalur yang sudah dipelajari?"""
+    if not (0.12 < prop < 0.95):
+        return False
+    if state.lebar_n < LEBAR_N_MIN:          # masih belajar: terima yang masuk akal
+        return True
+    rasio = prop / max(state.lebar_prop, 1e-6)
+    return (1.0 - LEBAR_TOL) < rasio < (1.0 + LEBAR_TOL)
+
+
+def _kalibrasi_lebar(state, prop):
+    """Rata-rata berjalan di awal, lalu EMA lambat."""
+    state.lebar_n += 1
+    a = max(LEBAR_ALPHA, 1.0 / state.lebar_n)
+    state.lebar_prop = (1 - a) * state.lebar_prop + a * prop
+    state.lebar_terkalibrasi = state.lebar_n >= LEBAR_N_MIN
+
+
+def _sisi_buruk(state, xl_ref, xr_ref):
+    """Bila lebar tidak konsisten, tentukan sisi mana yang dicurigai salah:
+    yang paling menyimpang dari posisi frame sebelumnya (atau yang datanya
+    lebih pendek bila belum ada riwayat)."""
+    if state.prev_ref is not None:
+        dl = abs(xl_ref - state.prev_ref[0])
+        dr = abs(xr_ref - state.prev_ref[1])
+        return "L" if dl > dr else "R"
+    sl = float(state.left.dom[1] - state.left.dom[0])
+    sr = float(state.right.dom[1] - state.right.dom[0])
+    return "L" if sl < sr else "R"
 
 
 def prediksi_riwayat(hist, n):
@@ -535,16 +757,54 @@ def prediksi_riwayat(hist, n):
     return rata + tren * langkah
 
 
+def r_deteksi(track, h, w):
+    """Derau ukur tiap titik saat deteksi langsung. Titik yang berada di luar
+    rentang data (hasil perpanjangan garis singgung) kurang dipercaya."""
+    t = to_t(Y_LEVELS * h, h)
+    lo, hi = float(track.dom[0]), float(track.dom[1])
+    jarak = np.maximum(np.maximum(lo - t, t - hi), 0.0)
+    return KF_R_DETEKSI * w * np.sqrt(1.0 + (jarak / 0.08) ** 2)
+
+
+def r_estimasi(hold, w):
+    """Derau ukur untuk estimasi dari riwayat: makin lama makin tidak pasti."""
+    return np.full(N_TITIK, KF_R_ESTIMASI * w * np.sqrt(1.0 + hold / 10.0))
+
+
 def finalize_lanes(state, w, h):
     """Tentukan koordinat FINAL kiri & kanan untuk frame ini.
+      0. validasi lebar jalur (buang sisi yang tidak konsisten)
       1. kedua garis terdeteksi              -> 'deteksi'
       2. hanya satu garis terdeteksi         -> 'turunan' (garis lain = garis itu + lebar)
       3. tidak ada deteksi                   -> 'estimasi' (rata-rata riwayat + tren)
       4. riwayat habis (> HOLD_MAX_FRAMES)   -> 'hilang'
+      5. Kalman filter menghaluskan semua titik
     """
     state.frame_idx += 1
     lv = Y_LEVELS * h
     fresh_l, fresh_r = state.left.fresh, state.right.fresh
+
+    # 0) validasi konsistensi lebar jalur + kalibrasi
+    if fresh_l and fresh_r:
+        xl_ref = state.left.x_at(Y_REF * h, h)
+        xr_ref = state.right.x_at(Y_REF * h, h)
+        prop = (xr_ref - xl_ref) / w
+        if (not VALIDASI_LEBAR) or _lebar_konsisten(state, prop):
+            if 0.15 < prop < 0.9:
+                _kalibrasi_lebar(state, prop)
+            state.lebar_bad = 0
+        else:
+            state.lebar_bad += 1
+            if _sisi_buruk(state, xl_ref, xr_ref) == "L":
+                fresh_l = False
+                state.left.reset()
+            else:
+                fresh_r = False
+                state.right.reset()
+            if state.lebar_bad >= LEBAR_BAD_MAX:      # kalibrasi lama mungkin salah
+                state.lebar_n = 0
+                state.lebar_bad = 0
+                state.lebar_terkalibrasi = False
 
     # 1) riwayat deteksi valid & penghitung 'hold'
     if fresh_l:
@@ -558,35 +818,46 @@ def finalize_lanes(state, w, h):
     else:
         state.kanan_hold += 1
 
-    # 2) kalibrasi lebar jalur bila kedua garis terdeteksi bersamaan
-    if fresh_l and fresh_r:
-        kalibrasi_lebar(state, w, h)
     lebar = lebar_jalur(lv, h, w, state.lebar_prop)
 
-    # 3) koordinat dasar dari deteksi langsung
+    # 2) koordinat dasar dari deteksi langsung
     xl = xr = None
+    rl = rr = None
     st_l = st_r = "hilang"
     if fresh_l:
-        xl, st_l = xs_di_level(state.left, h), "deteksi"
+        xl, st_l, rl = xs_di_level(state.left, h), "deteksi", r_deteksi(state.left, h, w)
     if fresh_r:
-        xr, st_r = xs_di_level(state.right, h), "deteksi"
+        xr, st_r, rr = xs_di_level(state.right, h), "deteksi", r_deteksi(state.right, h, w)
 
-    # 4) tidak ada deteksi sama sekali -> rata-rata riwayat + tren
+    # 3) tidak ada deteksi sama sekali -> rata-rata riwayat + tren
     if xl is None and xr is None:
         if state.kiri_hist and state.kiri_hold <= HOLD_MAX_FRAMES:
             xl = prediksi_riwayat(state.kiri_hist, state.kiri_hold)
-            st_l = "estimasi"
+            st_l, rl = "estimasi", r_estimasi(state.kiri_hold, w)
         if state.kanan_hist and state.kanan_hold <= HOLD_MAX_FRAMES:
             xr = prediksi_riwayat(state.kanan_hist, state.kanan_hold)
-            st_r = "estimasi"
+            st_r, rr = "estimasi", r_estimasi(state.kanan_hold, w)
 
-    # 5) satu sisi kosong -> turunkan dari sisi lain + lebar jalur
+    # 4) satu sisi kosong -> turunkan dari sisi lain + lebar jalur
     if xl is None and xr is not None:
         xl = xr - lebar
         st_l = "estimasi" if st_r == "estimasi" else "turunan"
+        rl = np.sqrt(rr ** 2 + (KF_R_TURUNAN * w) ** 2)
     elif xr is None and xl is not None:
         xr = xl + lebar
         st_r = "estimasi" if st_l == "estimasi" else "turunan"
+        rr = np.sqrt(rl ** 2 + (KF_R_TURUNAN * w) ** 2)
+
+    # 5) Kalman filter pada tiap titik (menghaluskan juga perpindahan antar-mode)
+    if USE_KALMAN:
+        if xl is not None:
+            xl = state.kf_kiri.langkah(xl, rl, w, 0.0 if st_l == "estimasi" else None)
+        else:
+            state.kf_kiri.reset()
+        if xr is not None:
+            xr = state.kf_kanan.langkah(xr, rr, w, 0.0 if st_r == "estimasi" else None)
+        else:
+            state.kf_kanan.reset()
 
     # 6) status & keyakinan
     if st_l == "hilang" and st_r == "hilang":
@@ -595,20 +866,33 @@ def finalize_lanes(state, w, h):
         status, keyakinan = "normal", 1.0
     else:
         status = "perkiraan"
-        if "estimasi" in (st_l, st_r):
-            hold = max(state.kiri_hold, state.kanan_hold)
-            keyakinan = 0.5 * max(0.0, 1.0 - hold / HOLD_MAX_FRAMES)
+        holds = []
+        if st_l == "estimasi":
+            holds.append(state.kiri_hold)
+        if st_r == "estimasi":
+            holds.append(state.kanan_hold)
+        if holds:
+            keyakinan = 0.5 * max(0.0, 1.0 - max(holds) / HOLD_MAX_FRAMES)
         else:
-            keyakinan = 0.7
+            keyakinan = 0.7 if state.lebar_terkalibrasi else 0.5
 
     # 7) tengah jalur & offset (dihitung di Y_REF)
-    tengah = offset_m = None
+    tengah = offset_m = lebar_ref = None
+    state.prev_ref = None
     if xl is not None and xr is not None:
         tengah = (xl + xr) / 2.0
         xl_r = float(np.interp(Y_REF, Y_LEVELS, xl))
         xr_r = float(np.interp(Y_REF, Y_LEVELS, xr))
+        state.prev_ref = (xl_r, xr_r)
         if xr_r - xl_r > 1:
-            offset_m = (w / 2.0 - (xl_r + xr_r) / 2.0) * LANE_WIDTH_M / (xr_r - xl_r)
+            lebar_ref = xr_r - xl_r
+            offset_m = (w / 2.0 - (xl_r + xr_r) / 2.0) * LANE_WIDTH_M / lebar_ref
+
+    # skala meter tiap titik = lebar jalur yang TERUKUR pada ketinggian itu
+    if xl is not None and xr is not None:
+        skala = np.maximum(xr - xl, 1.0)
+    else:
+        skala = lebar
 
     def bentuk(xs):
         """Ubah array x menjadi daftar titik: x, y (pixel) dan x_m (meter, + = kanan)."""
@@ -617,7 +901,7 @@ def finalize_lanes(state, w, h):
         return [
             {"x": int(round(x)), "y": int(round(y)),
              "x_m": round(float((x - w / 2.0) * LANE_WIDTH_M / lb), 3)}
-            for x, y, lb in zip(xs, lv, lebar)
+            for x, y, lb in zip(xs, lv, skala)
         ]
 
     return {
@@ -627,19 +911,35 @@ def finalize_lanes(state, w, h):
         "kalibrasi_lebar": state.lebar_terkalibrasi,
         "arah": state.arah,
         "offset_m": None if offset_m is None else round(float(offset_m), 3),
+        "lebar_px": None if lebar_ref is None else round(lebar_ref, 1),
         "kiri": {"status": st_l, "titik": bentuk(xl)},
         "kanan": {"status": st_r, "titik": bentuk(xr)},
         "tengah": bentuk(tengah),
     }
 
 
-def kurva_dari_hasil(info, h):
-    """Ubah titik-titik hasil final menjadi kurva halus (40 titik) untuk digambar."""
-    if info["titik"] is None:
+def analisis_frame(frame, state):
+    """Deteksi mentah + koordinat final. Mengembalikan (lines, roi_edges, poly, hasil)."""
+    h, w = frame.shape[:2]
+    lines, roi_edges, poly = detect_lanes(frame, state)
+    hasil = finalize_lanes(state, w, h)
+    return lines, roi_edges, poly, hasil
+
+
+def kurva_dari_hasil(info, h, w):
+    """Ubah titik-titik hasil final menjadi kurva halus (40 titik) untuk digambar.
+    Memakai parabola x(y) bila cocok dengan titik-titik; kalau tidak, interpolasi."""
+    titik = info["titik"]
+    if titik is None:
         return None
-    xs_lv = np.array([p["x"] for p in info["titik"]], dtype=np.float64)
+    lv = Y_LEVELS * h
+    xs_lv = np.array([p["x"] for p in titik], dtype=np.float64)
     ys = np.linspace(Y_TOP * h, Y_BOTTOM * h, 40)
-    xs = np.interp(ys, Y_LEVELS * h, xs_lv)
+    xs = np.interp(ys, lv, xs_lv)
+    if len(xs_lv) >= 4:
+        xq = np.polyval(np.polyfit(lv, xs_lv, 2), ys)
+        if np.max(np.abs(xq - xs)) < 0.012 * w:
+            xs = xq
     return np.stack([xs, ys], axis=1).astype(np.int32)
 
 
@@ -657,39 +957,137 @@ class PenulisKoordinat:
         self.f.close()
 
 
-def gambar_hasil_akhir(img, hasil):
-    """Tambahan visual: titik-titik untuk sisi yang diperkirakan (bukan deteksi
-    langsung) dan teks status jalur di pojok kiri bawah."""
-    warna = {"kiri": (0, 0, 255), "kanan": (0, 255, 255)}
-    for sisi in ("kiri", "kanan"):
-        info = hasil[sisi]
-        if info["titik"] is None or info["status"] == "deteksi":
-            continue
-        for p in info["titik"]:
-            cv2.circle(img, (p["x"], p["y"]), 4, warna[sisi], -1)
+def cetak_koordinat(hasil):
+    """Cetak koordinat final ke terminal (dipakai pada mode foto)."""
+    print(f"Status: {hasil['status']} (keyakinan {hasil['keyakinan']}) | "
+          f"arah: {hasil['arah']} | offset: {hasil['offset_m']} m | "
+          f"kiri: {hasil['kiri']['status']} | kanan: {hasil['kanan']['status']}")
+    kiri = hasil["kiri"]["titik"] or []
+    kanan = hasil["kanan"]["titik"] or []
+    tengah = hasil["tengah"] or []
+    print(f"{'y':>5} {'kiri':>6} {'tengah':>7} {'kanan':>6}   x_m kiri / kanan")
+    for k in range(N_TITIK):
+        y = (kiri or kanan)[k]["y"] if (kiri or kanan) else "-"
+        xl = kiri[k]["x"] if kiri else "-"
+        xc = tengah[k]["x"] if tengah else "-"
+        xr = kanan[k]["x"] if kanan else "-"
+        ml = kiri[k]["x_m"] if kiri else "-"
+        mr = kanan[k]["x_m"] if kanan else "-"
+        print(f"{y:>5} {xl:>6} {xc:>7} {xr:>6}   {ml} / {mr}")
 
+
+def gambar_koordinat(img, hasil):
+    """Gambar titik koordinat final beserta angkanya (x,y dalam pixel) dan
+    tabel koordinat di pojok kanan atas. Titik penuh = deteksi langsung;
+    lingkaran kosong = diturunkan / diestimasi."""
+    h, w = img.shape[:2]
+    s = w / 640.0
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.34 * s
+    warna = {"kiri": (0, 0, 255), "kanan": (0, 255, 255), "tengah": (255, 0, 255)}
+    daftar = (
+        ("kiri", hasil["kiri"]["titik"], hasil["kiri"]["status"]),
+        ("kanan", hasil["kanan"]["titik"], hasil["kanan"]["status"]),
+        ("tengah", hasil["tengah"], "deteksi"),
+    )
+
+    for nama, titik, st in daftar:
+        if not titik:
+            continue
+        for p in titik:
+            x, y = p["x"], p["y"]
+            r = max(2, int(3 * s))
+            if st == "deteksi":
+                cv2.circle(img, (x, y), r, warna[nama], -1, cv2.LINE_AA)
+            else:
+                cv2.circle(img, (x, y), r + 2, warna[nama], 1, cv2.LINE_AA)
+            txt = f"{x},{y}"
+            (tw, th), _ = cv2.getTextSize(txt, font, fs, 1)
+            if nama == "kiri":
+                tx, ty = x - tw - int(7 * s), y + th // 2
+            elif nama == "kanan":
+                tx, ty = x + int(7 * s), y + th // 2
+            else:
+                tx, ty = x - tw // 2, y + th + int(6 * s)
+            tx = int(np.clip(tx, 1, max(1, w - tw - 1)))
+            ty = int(np.clip(ty, th + 1, h - 2))
+            cv2.putText(img, txt, (tx, ty), font, fs, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, txt, (tx, ty), font, fs, warna[nama], 1, cv2.LINE_AA)
+
+    # --- tabel koordinat (pojok kanan atas)
+    kiri = hasil["kiri"]["titik"]
+    kanan = hasil["kanan"]["titik"]
+    tengah = hasil["tengah"]
+    if not (kiri or kanan):
+        return img
+    ref = kiri or kanan
+    fs_t = 0.36 * s
+    (tw0, th0), _ = cv2.getTextSize("0000", font, fs_t, 1)
+    colw = tw0 + int(8 * s)
+    lh = th0 + int(6 * s)
+    judul = "Koordinat (px)"
+    n_baris = len(ref) + 3
+    pw = int(4 * colw + 12 * s)
+    ph = int(n_baris * lh + 8 * s)
+    x0 = max(0, w - pw - 4)
+    y0 = int(28 * s)
+    if y0 + ph > h:
+        return img
+    roi = img[y0:y0 + ph, x0:x0 + pw]
+    img[y0:y0 + ph, x0:x0 + pw] = cv2.addWeighted(roi, 0.35, np.full_like(roi, 30), 0.65, 0)
+    cv2.rectangle(img, (x0, y0), (x0 + pw - 1, y0 + ph - 1), (255, 255, 255), 1)
+
+    def teks(txt, kol, baris, col):
+        cv2.putText(img, str(txt), (x0 + int(6 * s) + kol * colw, y0 + (baris + 1) * lh),
+                    font, fs_t, col, 1, cv2.LINE_AA)
+
+    cv2.putText(img, judul, (x0 + int(6 * s), y0 + lh), font, fs_t, (255, 255, 255), 1, cv2.LINE_AA)
+    # warna tabel dibuat lebih terang agar terbaca di latar gelap
+    wt = {"kiri": (110, 110, 255), "tengah": (255, 140, 255), "kanan": (0, 255, 255)}
+    for kol, (nm, col) in enumerate((("y", (255, 255, 255)), ("kiri", wt["kiri"]),
+                                     ("tgh", wt["tengah"]), ("kanan", wt["kanan"]))):
+        teks(nm, kol, 1, col)
+    for k in range(len(ref)):
+        teks(ref[k]["y"], 0, k + 2, (255, 255, 255))
+        teks(kiri[k]["x"] if kiri else "-", 1, k + 2, wt["kiri"])
+        teks(tengah[k]["x"] if tengah else "-", 2, k + 2, wt["tengah"])
+        teks(kanan[k]["x"] if kanan else "-", 3, k + 2, wt["kanan"])
+    off = hasil["offset_m"]
+    cv2.putText(img, f"offset: {off:+.2f} m" if off is not None else "offset: -",
+                (x0 + int(6 * s), y0 + (len(ref) + 3) * lh - int(2 * s)),
+                font, fs_t, (0, 255, 0), 1, cv2.LINE_AA)
+    return img
+
+
+def gambar_hasil_akhir(img, hasil, state):
+    """Tambahan visual: status jalur (di bawah panel kiri atas) dan angka koordinat."""
+    s = img.shape[1] / 640.0
     teks, col = {
         "normal": ("Jalur: NORMAL", (0, 255, 0)),
-        "perkiraan": ("Jalur: PERKIRAAN (sebagian dari riwayat)", (0, 165, 255)),
-        "hilang": ("Jalur: HILANG - kendaraan harus melambat", (0, 0, 255)),
+        "perkiraan": ("Jalur: PERKIRAAN", (0, 165, 255)),
+        "hilang": ("Jalur: HILANG - melambat", (0, 0, 255)),
     }[hasil["status"]]
-    teks += f"  (keyakinan {hasil['keyakinan']:.2f})"
-    cv2.putText(img, teks, (10, img.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, col, 2, cv2.LINE_AA)
+    teks += f" (keyakinan {hasil['keyakinan']:.2f})"
+    cv2.putText(img, teks, (int(8 * s), int(112 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5 * s, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(img, teks, (int(8 * s), int(112 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5 * s, col, 2, cv2.LINE_AA)
+    if state.show_coords:
+        gambar_koordinat(img, hasil)
     return img
 
 
 # ------------------------------------------------------------------ gambar
 def render_frame(frame, state, lines=None, roi_edges=None, poly=None, hasil=None):
     """Gambar garis jalur, area hijau, ROI, panel info di atas frame.
-    Jika 'hasil' diberikan (dari finalize_lanes), garis & area hijau mengikuti
-    koordinat FINAL (termasuk estimasi), bukan garis mentah."""
+    Jika 'hasil' diberikan, garis & area hijau mengikuti koordinat FINAL
+    (termasuk estimasi), bukan garis mentah."""
     h, w = frame.shape[:2]
     overlay = np.zeros_like(frame)
 
     if hasil is not None:
-        lp = kurva_dari_hasil(hasil["kiri"], h)
-        rp = kurva_dari_hasil(hasil["kanan"], h)
+        lp = kurva_dari_hasil(hasil["kiri"], h, w)
+        rp = kurva_dari_hasil(hasil["kanan"], h, w)
     else:
         lp = curve_points(state.left, h, w) if state.left.theta is not None else None
         rp = curve_points(state.right, h, w) if state.right.theta is not None else None
@@ -739,9 +1137,12 @@ def render_frame(frame, state, lines=None, roi_edges=None, poly=None, hasil=None
 
 
 def process_frame(frame, state):
-    """Deteksi + gambar untuk satu frame (tanpa output koordinat)."""
-    lines, roi_edges, poly = detect_lanes(frame, state)
-    return render_frame(frame, state, lines, roi_edges, poly)
+    """Deteksi + koordinat final + gambar untuk satu frame.
+    Mengembalikan (gambar_hasil, hasil_koordinat)."""
+    lines, roi_edges, poly, hasil = analisis_frame(frame, state)
+    out = render_frame(frame, state, lines, roi_edges, poly, hasil)
+    out = gambar_hasil_akhir(out, hasil, state)
+    return out, hasil
 
 
 # =====================================================================
@@ -765,36 +1166,42 @@ def _label(img, text):
 
 def build_stages(frame, state):
     """Jalankan pipeline SATU frame sambil mengumpulkan gambar tiap tahap.
-    Mengembalikan list [(judul, gambar_BGR), ...]. state ikut ter-update."""
+    Mengembalikan (stages, hasil): stages = [(judul, gambar_BGR), ...],
+    hasil = koordinat final. state ikut ter-update. Nomor tahap otomatis."""
     h, w = frame.shape[:2]
-    stages = [("01 Original (resize)", frame.copy())]
+    stages = []
 
-    gray, blur, edges = preprocess(frame)
-    stages.append(("02 Grayscale", gray))
-    stages.append(("03 Gaussian Blur", blur))
-    stages.append(("04 Canny Edge", edges))
+    def tambah(judul, img):
+        stages.append((f"{len(stages) + 1:02d} {judul}", img))
+
+    tambah("Original (resize)", frame.copy())
+
+    gray, eq, blur, edges, blur_raw = preprocess(frame)
+    tambah("Grayscale", gray)
+    if USE_CLAHE:
+        tambah("CLAHE (kontras adaptif)", eq)
+    tambah("Gaussian Blur", blur)
+    tambah("Canny Edge", edges)
 
     poly, roi_mask = get_roi(w, h)
-    roi_vis = frame.copy()
     tint = np.zeros_like(frame)
     cv2.fillPoly(tint, [poly], (0, 255, 0))
-    roi_vis = cv2.addWeighted(roi_vis, 1.0, tint, 0.35, 0)
+    roi_vis = cv2.addWeighted(frame.copy(), 1.0, tint, 0.35, 0)
     cv2.polylines(roi_vis, [poly], True, (255, 0, 0), 2)
-    stages.append(("05 ROI (area jalan)", roi_vis))
+    tambah("ROI (area jalan)", roi_vis)
 
     roi_edges = apply_roi(edges, roi_mask)
-    stages.append(("06 Edge di dalam ROI", roi_edges))
+    tambah("Edge di dalam ROI", roi_edges)
 
     bright = None
     if BRIGHT_DELTA > 0:
-        med = float(np.median(blur[roi_mask > 0]))
+        med = float(np.median(blur_raw[roi_mask > 0]))
         bright = cv2.dilate(
-            (blur > med + BRIGHT_DELTA).astype(np.uint8),
-            np.ones((BRIGHT_DILATE, BRIGHT_DILATE), np.uint8)
+            (blur_raw > med + BRIGHT_DELTA).astype(np.uint8), _BRIGHT_KERNEL
         ) > 0
-        stages.append(("07 Mask Brightness", bright.astype(np.uint8) * 255))
+        tambah("Mask Brightness", bright.astype(np.uint8) * 255)
         roi_edges = roi_edges * bright.astype(np.uint8)
-        stages.append(("08 Edge setelah Brightness Filter", roi_edges))
+        tambah("Edge setelah Brightness Filter", roi_edges)
 
     lines = cv2.HoughLinesP(
         roi_edges, 1, np.pi / 180, HOUGH_THRESH,
@@ -806,15 +1213,16 @@ def build_stages(frame, state):
         n_lines = len(lines)
         for x1, y1, x2, y2 in lines.reshape(-1, 4):
             cv2.line(hough_vis, (x1, y1), (x2, y2), (255, 255, 0), 2)
-    stages.append((f"09 HoughLinesP ({n_lines} segmen)", hough_vis))
+    tambah(f"HoughLinesP ({n_lines} segmen)", hough_vis)
 
-    Lp, Rp = collect_segments(lines, w, h, state.left, state.right, bright)
+    lebar_prop = state.lebar_prop if state.lebar_terkalibrasi else None
+    Lp, Rp = collect_segments(lines, w, h, state.left, state.right, bright, lebar_prop)
     seg_vis = frame.copy()
     for x, y in zip(*Lp):
         cv2.circle(seg_vis, (int(x), int(y)), 2, (0, 0, 255), -1)
     for x, y in zip(*Rp):
         cv2.circle(seg_vis, (int(x), int(y)), 2, (0, 255, 255), -1)
-    stages.append(("10 Klasifikasi Kiri(merah)/Kanan(kuning)", seg_vis))
+    tambah("Klasifikasi Kiri(merah)/Kanan(kuning)", seg_vis)
 
     state.left.update(fit_lane(Lp[0], Lp[1], w, h, "L", state.left.theta), w, h)
     state.right.update(fit_lane(Rp[0], Rp[1], w, h, "R", state.right.theta), w, h)
@@ -826,12 +1234,23 @@ def build_stages(frame, state):
         cv2.polylines(fit_vis, [curve_points(state.left, h, w)], False, (0, 0, 255), th)
     if state.right.theta is not None:
         cv2.polylines(fit_vis, [curve_points(state.right, h, w)], False, (0, 255, 255), th)
-    stages.append(("11 Fitting kurva + EMA", fit_vis))
+    tambah("Fitting kurva (ridge + EMA)", fit_vis)
 
-    final = render_frame(frame, state, lines, roi_edges, poly)
-    stages.append((f"12 Hasil Akhir: {state.arah}", final))
+    hasil = finalize_lanes(state, w, h)
 
-    return stages
+    koor_vis = frame.copy()
+    for nama, col in (("kiri", (0, 0, 255)), ("kanan", (0, 255, 255))):
+        c = kurva_dari_hasil(hasil[nama], h, w)
+        if c is not None:
+            cv2.polylines(koor_vis, [c], False, col, th)
+    gambar_koordinat(koor_vis, hasil)
+    tambah(f"Koordinat final ({hasil['status']})", koor_vis)
+
+    final = render_frame(frame, state, lines, roi_edges, poly, hasil)
+    final = gambar_hasil_akhir(final, hasil, state)
+    tambah(f"Hasil Akhir: {state.arah}", final)
+
+    return stages, hasil
 
 
 def make_montage(stages, cols=3, tile_w=360):
@@ -855,8 +1274,8 @@ def make_montage(stages, cols=3, tile_w=360):
     return np.vstack(rows)
 
 
-def save_stages(stages, out_dir="hasil_tahap", prefix=""):
-    """Simpan tiap tahap sebagai file .jpg + satu gambar rangkuman."""
+def save_stages(stages, out_dir="hasil_tahap", prefix="", hasil=None):
+    """Simpan tiap tahap sebagai file .jpg + gambar rangkuman (+ koordinat.json)."""
     os.makedirs(out_dir, exist_ok=True)
     for title, img in stages:
         nama = title.split("(")[0].split(":")[0].strip()
@@ -867,6 +1286,11 @@ def save_stages(stages, out_dir="hasil_tahap", prefix=""):
     cv2.imwrite(mont, make_montage(stages))
     print(f"[OK] {len(stages)} tahap tersimpan di folder: {out_dir}/")
     print(f"[OK] Rangkuman semua tahap: {mont}")
+    if hasil is not None:
+        jpath = os.path.join(out_dir, f"{prefix}koordinat.json")
+        with open(jpath, "w", encoding="utf-8") as f:
+            json.dump(hasil, f, ensure_ascii=False, indent=2)
+        print(f"[OK] Koordinat final: {jpath}")
 
 
 def _in_colab():
@@ -931,18 +1355,18 @@ def show_stages(stages, per_stage=False):
 
 def proses_per_tahap(frame, out_dir="hasil_tahap", warmup=12,
                      tampil=True, per_stage=False, simpan=True, sisi=None):
-    """FUNGSI UTAMA untuk Colab / notebook."""
+    """FUNGSI UTAMA untuk Colab / notebook. Mengembalikan list tahap."""
     if sisi:
         set_sisi(sisi)
     h0, w0 = frame.shape[:2]
     if w0 > PROCESS_WIDTH:
         frame = cv2.resize(frame, (PROCESS_WIDTH, int(h0 * PROCESS_WIDTH / w0)))
     state = LaneState()
-    for _ in range(warmup):
-        detect_lanes(frame, state)
-    stages = build_stages(frame, state)
+    for _ in range(warmup):                  # foto cuma 1 frame -> ulang agar filter stabil
+        analisis_frame(frame, state)
+    stages, hasil = build_stages(frame, state)
     if simpan:
-        save_stages(stages, out_dir)
+        save_stages(stages, out_dir, hasil=hasil)
     if tampil:
         show_stages(stages, per_stage=per_stage)
     return stages
@@ -953,12 +1377,20 @@ IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 
 
 def show_still_result(frame, save_path=None,
-                      window="Deteksi Jalur Jalan Lurus dan Belok"):
-    """Proses satu foto (dengan warmup) lalu tampilkan di jendela OpenCV."""
+                      window="Deteksi Jalur Jalan Lurus dan Belok",
+                      koordinat_path=None):
+    """Proses satu foto (dengan warmup), cetak koordinat, lalu tampilkan."""
     state = LaneState()
 
     for _ in range(12):
-        out = process_frame(frame, state)
+        out, hasil = process_frame(frame, state)
+
+    cetak_koordinat(hasil)
+    if koordinat_path:
+        penulis = PenulisKoordinat(koordinat_path)
+        penulis.tulis(hasil)
+        penulis.tutup()
+        print("Koordinat tersimpan ke:", koordinat_path)
 
     if save_path:
         cv2.imwrite(save_path, out)
@@ -967,15 +1399,21 @@ def show_still_result(frame, save_path=None,
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.imshow(window, out)
 
-    print("Jendela hasil terbuka. Tekan 'd' untuk debug, "
-          "tombol apa saja lain (atau tutup jendelanya) untuk lanjut.")
+    print("Jendela hasil terbuka. Tekan 'd' = debug, 'c' = angka koordinat, "
+          "tombol lain (atau tutup jendela) untuk lanjut.")
 
     while True:
         key = cv2.waitKey(50) & 0xFF
 
         if key == ord("d"):
             state.debug = not state.debug
-            out = process_frame(frame, state)
+            out, _ = process_frame(frame, state)
+            cv2.imshow(window, out)
+            continue
+
+        if key == ord("c"):
+            state.show_coords = not state.show_coords
+            out, _ = process_frame(frame, state)
             cv2.imshow(window, out)
             continue
 
@@ -1002,16 +1440,28 @@ def run_on_image(path, args):
         frame = cv2.resize(frame, (args.width, int(h0 * args.width / w0)))
 
     if args.stages:
-        proses_per_tahap(frame, out_dir=args.stages_dir)
+        h, w = frame.shape[:2]
+        state = LaneState()
+        for _ in range(12):
+            analisis_frame(frame, state)
+        stages, hasil = build_stages(frame, state)
+        save_stages(stages, args.stages_dir, hasil=hasil)
+        cetak_koordinat(hasil)
+        if args.koordinat:
+            penulis = PenulisKoordinat(args.koordinat)
+            penulis.tulis(hasil)
+            penulis.tutup()
+            print("Koordinat tersimpan ke:", args.koordinat)
         if args.save:
-            state = LaneState()
+            state2 = LaneState()
             for _ in range(12):
-                out = process_frame(frame, state)
+                out, _ = process_frame(frame, state2)
             cv2.imwrite(args.save, out)
             print("Tersimpan ke:", args.save)
+        show_stages(stages)
         return
 
-    show_still_result(frame, args.save or None)
+    show_still_result(frame, args.save or None, koordinat_path=args.koordinat or None)
     cv2.destroyAllWindows()
 
 
@@ -1106,9 +1556,20 @@ def main():
     )
     ap.add_argument(
         "--koordinat", default="",
-        help="simpan koordinat jalur tiap frame ke file .jsonl (mis. koordinat.jsonl). "
-             "Khusus webcam/video"
+        help="simpan koordinat jalur ke file .jsonl (mis. koordinat.jsonl). "
+             "Video/webcam: 1 baris per frame. Foto: 1 baris."
     )
+    # --- opsi algoritma (untuk membandingkan sebelum/sesudah)
+    ap.add_argument("--clahe", action="store_true",
+                    help="aktifkan CLAHE (perkuat kontras marka pudar)")
+    ap.add_argument("--tanpa-kalman", action="store_true",
+                    help="matikan Kalman filter (smoothing hanya EMA)")
+    ap.add_argument("--ransac", action="store_true",
+                    help="aktifkan RANSAC (fit tahan outlier); default mati")
+    ap.add_argument("--tanpa-validasi-lebar", action="store_true",
+                    help="matikan validasi lebar jalur")
+    ap.add_argument("--tanpa-angka", action="store_true",
+                    help="jangan tampilkan angka koordinat di gambar (tombol c = on/off)")
 
     args, _ = ap.parse_known_args()
 
@@ -1117,6 +1578,16 @@ def main():
         globals()["MAX_LANE_GAP"] = args.lebar_max
     if args.horizon is not None:
         globals()["Y_HORIZON"] = args.horizon
+    if args.clahe:
+        globals()["USE_CLAHE"] = True
+    if args.tanpa_kalman:
+        globals()["USE_KALMAN"] = False
+    if args.ransac:
+        globals()["USE_RANSAC"] = True
+    if args.tanpa_validasi_lebar:
+        globals()["VALIDASI_LEBAR"] = False
+    if args.tanpa_angka:
+        globals()["SHOW_COORDS"] = False
 
     if not args.stages_dir:
         nama = os.path.splitext(os.path.basename(args.source))[0]
@@ -1208,15 +1679,14 @@ def main():
 
         ambil_tahap = (args.stages_frame > 0 and i == args.stages_frame)
         if ambil_tahap:
-            stages = build_stages(frame.copy(), copy.deepcopy(state))
-            save_stages(stages, args.stages_dir, prefix=f"frame{i:05d}_")
+            stages, hs = build_stages(frame.copy(), copy.deepcopy(state))
+            save_stages(stages, args.stages_dir, prefix=f"frame{i:05d}_", hasil=hs)
             show_stages(stages)
             t_start = time.perf_counter() - pos / fps_src
 
         h, w = frame.shape[:2]
         if args.skip <= 1 or i % args.skip == 0 or poly is None:
-            lines, roi_edges, poly = detect_lanes(frame, state)
-            hasil = finalize_lanes(state, w, h)
+            lines, roi_edges, poly, hasil = analisis_frame(frame, state)
             hasil["sumber_frame"] = src_idx
             waktu = (time.perf_counter() - t_start) if is_cam else (src_idx / fps_src)
             hasil["waktu_detik"] = round(waktu, 3)
@@ -1224,8 +1694,7 @@ def main():
                 penulis.tulis(hasil)
 
         out = render_frame(frame, state, lines, roi_edges, poly, hasil)
-        if hasil is not None:
-            out = gambar_hasil_akhir(out, hasil)
+        out = gambar_hasil_akhir(out, hasil, state)
 
         i += 1
 
@@ -1265,10 +1734,13 @@ def main():
         if key == ord("d"):
             state.debug = not state.debug
 
+        if key == ord("c"):
+            state.show_coords = not state.show_coords
+
         if key == ord("p"):
             print("Mengambil hasil per tahap pada frame", i)
-            stages = build_stages(frame.copy(), copy.deepcopy(state))
-            save_stages(stages, args.stages_dir, prefix=f"frame{i:05d}_")
+            stages, hs = build_stages(frame.copy(), copy.deepcopy(state))
+            save_stages(stages, args.stages_dir, prefix=f"frame{i:05d}_", hasil=hs)
             show_stages(stages)
             t_start = time.perf_counter() - pos / fps_src
 
