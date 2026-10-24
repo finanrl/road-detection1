@@ -26,6 +26,7 @@ import argparse
 import copy       # deepcopy state (hasil per tahap pada video)
 import json       # menulis koordinat ke file JSON
 import os         # membuat folder penyimpanan
+import re         # membersihkan nama file tahap
 import threading  # membaca kamera di thread terpisah (anti-delay)
 import time       # pengatur kecepatan video & hitung FPS
 from collections import deque  # riwayat deteksi untuk fallback
@@ -976,86 +977,178 @@ def cetak_koordinat(hasil):
         print(f"{y:>5} {xl:>6} {xc:>7} {xr:>6}   {ml} / {mr}")
 
 
-def gambar_koordinat(img, hasil):
-    """Gambar titik koordinat final beserta angkanya (x,y dalam pixel) dan
-    tabel koordinat di pojok kanan atas. Titik penuh = deteksi langsung;
-    lingkaran kosong = diturunkan / diestimasi."""
+# ================================================================
+#   TAMPILAN KOORDINAT (versi rapi)
+# ================================================================
+LABEL_TENGAH = True          # False = label x,y garis tengah hanya ada di tabel
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+WARNA_SISI = {               # warna titik (BGR), sama dengan warna garis
+    "kiri": (0, 0, 255),
+    "tengah": (255, 0, 255),
+    "kanan": (0, 255, 255),
+}
+WARNA_TEKS = {               # warna teks, dibuat lebih terang agar terbaca
+    "kiri": (120, 120, 255),
+    "tengah": (255, 150, 255),
+    "kanan": (0, 255, 255),
+}
+
+
+def _titik(img, x, y, warna, langsung, s):
+    """Penuh + tepi putih = hasil deteksi langsung.
+    Ring berongga = diturunkan dari sisi lain / estimasi."""
+    r = max(2, int(round(3 * s)))
+    if langsung:
+        cv2.circle(img, (x, y), r + 1, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, (x, y), r, warna, -1, cv2.LINE_AA)
+    else:
+        cv2.circle(img, (x, y), r + 1, warna, 2, cv2.LINE_AA)
+
+
+def _label_kotak(img, x, y, teks, sisi, s):
+    """Label kiri/kanan: kotak gelap dengan tepi berwarna sisi.
+    Kotak kiri diletakkan di kiri titik, kotak kanan di kanan titik."""
     h, w = img.shape[:2]
-    s = w / 640.0
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.36 * s
+    (tw, th), base = cv2.getTextSize(teks, FONT, fs, 1)
+    pad = max(2, int(round(3 * s)))
+    gap = max(3, int(round(6 * s)))
+    bw, bh = tw + 2 * pad, th + base + 2 * pad
+    if bw >= w or bh >= h:
+        return
+    bx = x - gap - bw if sisi == "kiri" else x + gap
+    by = y - bh // 2
+    bx = int(np.clip(bx, 0, w - bw - 1))
+    by = int(np.clip(by, 0, h - bh - 1))
+    roi = img[by:by + bh, bx:bx + bw]
+    img[by:by + bh, bx:bx + bw] = cv2.addWeighted(roi, 0.25, np.zeros_like(roi), 0.75, 0)
+    cv2.rectangle(img, (bx, by), (bx + bw - 1, by + bh - 1), WARNA_SISI[sisi], 1, cv2.LINE_AA)
+    cv2.putText(img, teks, (bx + pad, by + pad + th), FONT, fs,
+                WARNA_TEKS[sisi], 1, cv2.LINE_AA)
+
+
+def _label_tengah(img, x, y, teks, s):
+    """Label garis tengah: teks berbingkai hitam tanpa kotak, di bawah titik,
+    supaya tidak menumpuk dengan titik di baris berikutnya."""
+    h, w = img.shape[:2]
     fs = 0.34 * s
-    warna = {"kiri": (0, 0, 255), "kanan": (0, 255, 255), "tengah": (255, 0, 255)}
-    daftar = (
-        ("kiri", hasil["kiri"]["titik"], hasil["kiri"]["status"]),
-        ("kanan", hasil["kanan"]["titik"], hasil["kanan"]["status"]),
-        ("tengah", hasil["tengah"], "deteksi"),
-    )
+    (tw, th), _ = cv2.getTextSize(teks, FONT, fs, 1)
+    tx = int(np.clip(x - tw // 2, 1, max(1, w - tw - 2)))
+    ty = min(h - 2, y + int(round(5 * s)) + th)
+    cv2.putText(img, teks, (tx, ty), FONT, fs, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, teks, (tx, ty), FONT, fs, WARNA_TEKS["tengah"], 1, cv2.LINE_AA)
 
-    for nama, titik, st in daftar:
-        if not titik:
-            continue
-        for p in titik:
-            x, y = p["x"], p["y"]
-            r = max(2, int(3 * s))
-            if st == "deteksi":
-                cv2.circle(img, (x, y), r, warna[nama], -1, cv2.LINE_AA)
-            else:
-                cv2.circle(img, (x, y), r + 2, warna[nama], 1, cv2.LINE_AA)
-            txt = f"{x},{y}"
-            (tw, th), _ = cv2.getTextSize(txt, font, fs, 1)
-            if nama == "kiri":
-                tx, ty = x - tw - int(7 * s), y + th // 2
-            elif nama == "kanan":
-                tx, ty = x + int(7 * s), y + th // 2
-            else:
-                tx, ty = x - tw // 2, y + th + int(6 * s)
-            tx = int(np.clip(tx, 1, max(1, w - tw - 1)))
-            ty = int(np.clip(ty, th + 1, h - 2))
-            cv2.putText(img, txt, (tx, ty), font, fs, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(img, txt, (tx, ty), font, fs, warna[nama], 1, cv2.LINE_AA)
 
-    # --- tabel koordinat (pojok kanan atas)
+def _tabel_koordinat(img, hasil, s):
+    """Tabel koordinat (x, y) di pojok kanan atas gambar."""
     kiri = hasil["kiri"]["titik"]
     kanan = hasil["kanan"]["titik"]
     tengah = hasil["tengah"]
-    if not (kiri or kanan):
-        return img
     ref = kiri or kanan
-    fs_t = 0.36 * s
-    (tw0, th0), _ = cv2.getTextSize("0000", font, fs_t, 1)
-    colw = tw0 + int(8 * s)
-    lh = th0 + int(6 * s)
-    judul = "Koordinat (px)"
-    n_baris = len(ref) + 3
-    pw = int(4 * colw + 12 * s)
-    ph = int(n_baris * lh + 8 * s)
-    x0 = max(0, w - pw - 4)
-    y0 = int(28 * s)
+    if not ref:
+        return
+    h, w = img.shape[:2]
+    fs_j, fs_i = 0.40 * s, 0.36 * s
+    px, py = int(round(7 * s)), int(round(3 * s))
+
+    judul = "Koordinat (x, y) px"
+    header = ["#", "KIRI", "TENGAH", "KANAN"]
+    isi = [
+        [str(k + 1)] + [f"{lst[k]['x']}, {ref[k]['y']}" if lst else "-"
+                        for lst in (kiri, tengah, kanan)]
+        for k in range(len(ref))
+    ]
+    offset = hasil["offset_m"]
+    kaki = f"Offset: {offset:+.2f} m" if offset is not None else "Offset: -"
+    if offset is None:
+        warna_kaki = (255, 255, 255)
+    else:
+        warna_kaki = (0, 255, 0) if abs(offset) < OFFSET_OK_M else (0, 165, 255)
+
+    # ukuran kolom
+    kol = [0, 0, 0, 0]
+    for baris_teks in [header] + isi:
+        for c, teks in enumerate(baris_teks):
+            kol[c] = max(kol[c], cv2.getTextSize(teks, FONT, fs_i, 1)[0][0])
+    kol_w = [v + 2 * px for v in kol]
+    lebar_judul = cv2.getTextSize(judul, FONT, fs_j, 1)[0][0] + 2 * px
+    if lebar_judul > sum(kol_w):
+        kol_w[-1] += lebar_judul - sum(kol_w)
+    pw = sum(kol_w)
+
+    # tinggi baris
+    (_, th_j), b_j = cv2.getTextSize(judul, FONT, fs_j, 1)
+    (_, th_i), b_i = cv2.getTextSize("Ag", FONT, fs_i, 1)
+    lh_j = th_j + b_j + 2 * py
+    lh_i = th_i + b_i + 2 * py
+    ph = lh_j + lh_i * (len(isi) + 2)       # judul + header + data + offset
+
+    x0 = max(0, w - pw - int(round(6 * s)))
+    y0 = int(round(28 * s))
     if y0 + ph > h:
-        return img
-    roi = img[y0:y0 + ph, x0:x0 + pw]
-    img[y0:y0 + ph, x0:x0 + pw] = cv2.addWeighted(roi, 0.35, np.full_like(roi, 30), 0.65, 0)
-    cv2.rectangle(img, (x0, y0), (x0 + pw - 1, y0 + ph - 1), (255, 255, 255), 1)
+        return
 
-    def teks(txt, kol, baris, col):
-        cv2.putText(img, str(txt), (x0 + int(6 * s) + kol * colw, y0 + (baris + 1) * lh),
-                    font, fs_t, col, 1, cv2.LINE_AA)
+    # latar, bingkai, dan bar judul
+    img[y0:y0 + ph, x0:x0 + pw] = (28, 28, 28)
+    cv2.rectangle(img, (x0, y0), (x0 + pw - 1, y0 + ph - 1), (200, 200, 200), 1)
+    cv2.rectangle(img, (x0, y0), (x0 + pw - 1, y0 + lh_j - 1), (120, 70, 30), -1)
+    cv2.putText(img, judul, (x0 + px, y0 + py + th_j), FONT, fs_j,
+                (255, 255, 255), 1, cv2.LINE_AA)
 
-    cv2.putText(img, judul, (x0 + int(6 * s), y0 + lh), font, fs_t, (255, 255, 255), 1, cv2.LINE_AA)
-    # warna tabel dibuat lebih terang agar terbaca di latar gelap
-    wt = {"kiri": (110, 110, 255), "tengah": (255, 140, 255), "kanan": (0, 255, 255)}
-    for kol, (nm, col) in enumerate((("y", (255, 255, 255)), ("kiri", wt["kiri"]),
-                                     ("tgh", wt["tengah"]), ("kanan", wt["kanan"]))):
-        teks(nm, kol, 1, col)
-    for k in range(len(ref)):
-        teks(ref[k]["y"], 0, k + 2, (255, 255, 255))
-        teks(kiri[k]["x"] if kiri else "-", 1, k + 2, wt["kiri"])
-        teks(tengah[k]["x"] if tengah else "-", 2, k + 2, wt["tengah"])
-        teks(kanan[k]["x"] if kanan else "-", 3, k + 2, wt["kanan"])
-    off = hasil["offset_m"]
-    cv2.putText(img, f"offset: {off:+.2f} m" if off is not None else "offset: -",
-                (x0 + int(6 * s), y0 + (len(ref) + 3) * lh - int(2 * s)),
-                font, fs_t, (0, 255, 0), 1, cv2.LINE_AA)
+    def tulis_baris(ry, cells, warna, latar=None):
+        """Tulis satu baris tabel, teks rata tengah per kolom."""
+        if latar is not None:
+            cv2.rectangle(img, (x0, ry), (x0 + pw - 1, ry + lh_i - 1), latar, -1)
+        xk = x0
+        for c, teks in enumerate(cells):
+            tw = cv2.getTextSize(teks, FONT, fs_i, 1)[0][0]
+            cv2.putText(img, teks, (xk + (kol_w[c] - tw) // 2, ry + py + th_i),
+                        FONT, fs_i, warna[c], 1, cv2.LINE_AA)
+            xk += kol_w[c]
+
+    y = y0 + lh_j
+    tulis_baris(y, header,
+                [(255, 255, 255), WARNA_TEKS["kiri"], WARNA_TEKS["tengah"], WARNA_TEKS["kanan"]],
+                latar=(60, 60, 60))
+    y += lh_i
+    cv2.line(img, (x0, y - 1), (x0 + pw - 1, y - 1), (150, 150, 150), 1)
+
+    for k, baris_teks in enumerate(isi):      # baris selang-seling
+        tulis_baris(y, baris_teks,
+                    [(170, 170, 170), (255, 255, 255), (255, 255, 255), (255, 255, 255)],
+                    latar=(40, 40, 40) if k % 2 else None)
+        y += lh_i
+
+    cv2.line(img, (x0, y - 1), (x0 + pw - 1, y - 1), (150, 150, 150), 1)
+    cv2.putText(img, kaki, (x0 + px, y + py + th_i), FONT, fs_i,
+                warna_kaki, 1, cv2.LINE_AA)
+
+
+def gambar_koordinat(img, hasil):
+    """Gambar titik (x, y) pada garis kiri, kanan, dan tengah, lalu tabel koordinat."""
+    h, w = img.shape[:2]
+    s = w / 640.0
+    kiri_st, kanan_st = hasil["kiri"]["status"], hasil["kanan"]["status"]
+    daftar = [
+        ("kiri", hasil["kiri"]["titik"], kiri_st == "deteksi"),
+        ("kanan", hasil["kanan"]["titik"], kanan_st == "deteksi"),
+        ("tengah", hasil["tengah"], kiri_st == "deteksi" and kanan_st == "deteksi"),
+    ]
+    # titik dulu, baru label (label selalu tampil di atas titik)
+    for nama, titik, langsung in daftar:
+        for p in titik or []:
+            _titik(img, p["x"], p["y"], WARNA_SISI[nama], langsung, s)
+    for nama, titik, _ in daftar:
+        if not titik or (nama == "tengah" and not LABEL_TENGAH):
+            continue
+        for p in titik:
+            teks = f"{p['x']}, {p['y']}"
+            if nama == "tengah":
+                _label_tengah(img, p["x"], p["y"], teks, s)
+            else:
+                _label_kotak(img, p["x"], p["y"], teks, nama, s)
+    _tabel_koordinat(img, hasil, s)
     return img
 
 
@@ -1155,15 +1248,6 @@ def _bgr(img):
     return img.copy()
 
 
-def _label(img, text):
-    """Tulis judul tahap di pojok kiri atas gambar (pada bar gelap)."""
-    out = _bgr(img)
-    cv2.rectangle(out, (0, 0), (out.shape[1], 24), (30, 30, 30), -1)
-    cv2.putText(out, text, (6, 17), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
-
-
 def build_stages(frame, state):
     """Jalankan pipeline SATU frame sambil mengumpulkan gambar tiap tahap.
     Mengembalikan (stages, hasil): stages = [(judul, gambar_BGR), ...],
@@ -1253,37 +1337,90 @@ def build_stages(frame, state):
     return stages, hasil
 
 
-def make_montage(stages, cols=3, tile_w=360):
-    """Gabungkan semua tahap jadi satu gambar grid (cols kolom)."""
+# ================================================================
+#   SIMPAN HASIL PER TAHAP (gaya montage: bar judul di atas gambar)
+# ================================================================
+JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 95]
+WARNA_BAR = (30, 30, 30)          # bar judul (abu gelap, sama seperti montage)
+WARNA_AKSEN = (200, 140, 60)      # garis aksen di bawah bar judul
+
+
+def _kartu(img, judul):
+    """Satu gambar tahap dengan bar judul di atasnya. Ukuran bar dan huruf
+    mengikuti lebar gambar, jadi tetap rapi di file satuan maupun di montage."""
+    img = _bgr(img)
+    h, w = img.shape[:2]
+    s = w / 640.0
+    pad = max(8, int(round(10 * s)))
+    skala = max(0.42, 0.6 * s)
+    tebal = 2 if skala >= 0.55 else 1
+
+    # kecilkan huruf bila judul terlalu panjang untuk lebar gambar
+    (tw, _), _ = cv2.getTextSize(judul, FONT, skala, tebal)
+    if tw > w - 2 * pad:
+        skala *= (w - 2 * pad) / tw
+    (_, th), _ = cv2.getTextSize(judul, FONT, skala, tebal)
+
+    bar_h = th + 2 * pad
+    kartu = np.zeros((bar_h + h, w, 3), np.uint8)
+    kartu[bar_h:] = img
+    kartu[:bar_h] = WARNA_BAR
+    kartu[bar_h - max(2, int(round(3 * s))):bar_h] = WARNA_AKSEN
+    cv2.putText(kartu, judul, (pad, pad + th), FONT, skala,
+                (255, 255, 255), tebal, cv2.LINE_AA)
+    cv2.rectangle(kartu, (0, 0), (w - 1, bar_h + h - 1), (70, 70, 70), 1)
+    return kartu
+
+
+def make_montage(stages, cols=3, tile_w=360, jarak=6):
+    """Gabungkan semua tahap jadi satu grid (cols kolom) dengan jarak antar kartu."""
     tiles = []
     for title, img in stages:
         img = _bgr(img)
         r = tile_w / img.shape[1]
         img = cv2.resize(img, (tile_w, int(img.shape[0] * r)))
-        tiles.append(_label(img, title))
+        tiles.append(_kartu(img, title))
+
     th = max(t.shape[0] for t in tiles)
+    lebar_baris = cols * tile_w + (cols - 1) * jarak
     rows = []
     for i in range(0, len(tiles), cols):
-        row = tiles[i:i + cols]
-        row = [cv2.copyMakeBorder(t, 0, th - t.shape[0], 0, 0,
-                                  cv2.BORDER_CONSTANT, value=(0, 0, 0))
-               for t in row]
-        while len(row) < cols:
-            row.append(np.zeros((th, tile_w, 3), np.uint8))
-        rows.append(np.hstack(row))
-    return np.vstack(rows)
+        baris = []
+        for k in range(cols):
+            if k > 0:
+                baris.append(np.zeros((th, jarak, 3), np.uint8))
+            sel = np.zeros((th, tile_w, 3), np.uint8)
+            if i + k < len(tiles):
+                t = tiles[i + k]
+                sel[:t.shape[0]] = t
+            baris.append(sel)
+        rows.append(np.hstack(baris))
+
+    celah = np.zeros((jarak, lebar_baris, 3), np.uint8)
+    susun = []
+    for k, r in enumerate(rows):
+        if k > 0:
+            susun.append(celah)
+        susun.append(r)
+    return np.vstack(susun)
+
+
+def _nama_file(judul):
+    """'03 Gaussian Blur' -> '03_gaussian_blur'
+    '10 Klasifikasi Kiri(merah)/Kanan(kuning)' -> '10_klasifikasi_kiri_kanan'"""
+    bagian = judul.split(":")[0]
+    bagian = re.sub(r"\(.*?\)", "", bagian)
+    return re.sub(r"[^a-z0-9]+", "_", bagian.lower()).strip("_")
 
 
 def save_stages(stages, out_dir="hasil_tahap", prefix="", hasil=None):
-    """Simpan tiap tahap sebagai file .jpg + gambar rangkuman (+ koordinat.json)."""
+    """Simpan tiap tahap sebagai gambar satuan (ber-judul), montage, dan koordinat.json."""
     os.makedirs(out_dir, exist_ok=True)
     for title, img in stages:
-        nama = title.split("(")[0].split(":")[0].strip()
-        nama = nama.lower().replace(" ", "_").replace("/", "_")
-        path = os.path.join(out_dir, f"{prefix}{nama}.jpg")
-        cv2.imwrite(path, _bgr(img))
+        path = os.path.join(out_dir, f"{prefix}{_nama_file(title)}.jpg")
+        cv2.imwrite(path, _kartu(img, title), JPEG_PARAMS)
     mont = os.path.join(out_dir, f"{prefix}00_semua_tahap.jpg")
-    cv2.imwrite(mont, make_montage(stages))
+    cv2.imwrite(mont, make_montage(stages), JPEG_PARAMS)
     print(f"[OK] {len(stages)} tahap tersimpan di folder: {out_dir}/")
     print(f"[OK] Rangkuman semua tahap: {mont}")
     if hasil is not None:
@@ -1767,3 +1904,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

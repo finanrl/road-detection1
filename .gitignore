@@ -1,2 +1,14 @@
-
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+hasil_tahap/
+*.jsonl
+snapshot_*.jpg
+__pycache__/
+*.pyc
 video_jalan.mp4
+koordinat.jsonl
