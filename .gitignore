@@ -1,14 +1,20 @@
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.jpg
-*.jpeg
-*.png
-hasil_tahap/
-*.jsonl
-snapshot_*.jpg
+# Abaikan semua file
+*
+
+# Tetap izinkan folder
+!*/
+
+# Abaikan folder yang tidak boleh ikut
+.venv/
+venv/
 __pycache__/
-*.pyc
-video_jalan.mp4
-koordinat.jsonl
+.ipynb_checkpoints/
+.vscode/
+
+# File yang boleh ada di repository
+!*.py
+!*.ipynb
+!*.pptx
+!*.yml
+!README.md
+!.gitignore
