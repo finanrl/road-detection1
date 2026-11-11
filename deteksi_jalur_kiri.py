@@ -1,45 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Deteksi Jalur Kiri pada Video Jalan (dashcam)
-=============================================
-ROI   : 40% bagian bawah frame, selebar frame (persegi panjang).
-        Garis ROI TIDAK digambar, hanya dipakai membatasi area pencarian.
-Target: JALUR KIRI, yaitu jalur tempat kendaraan berjalan.
+Deteksi Jalur pada Video Jalan (dashcam)
+========================================
+Membagi jalan di depan kendaraan menjadi jalur-jalur, lalu menggambarnya dengan warna
+berbeda dan menampilkan titik koordinat x,y di setiap garis.
 
-Susunan jalan yang didukung:
-  2 jalur : | jalur kiri | jalur berlawanan |
-  3 jalur : | bahu jalan | jalur kiri | jalur berlawanan |
+ROI         : 40% bagian bawah frame, selebar frame. Hanya membatasi area pencarian garis.
+              Garis ROI disembunyikan secara default (tampilkan dengan --tampil-roi atau tombol r).
+
+Jumlah jalur (otomatis, atau paksa dengan --jalur 2 / --jalur 3):
+  2 jalur : | jalur kiri | jalur kanan |
+  3 jalur : | bahu | jalur kiri | jalur kanan |
+  Jalur kanan tambahan (3 jalur) dikenali bila di kanan garis tepi kanan masih ada aspal.
+
+Garis yang dilacak:
+  tepi kiri    (biru)    : tepi kiri jalur kiri (2 jalur) / tepi luar bahu (3 jalur)
+  garis tengah (kuning)  : pemisah jalur kiri dan jalur kanan (2 jalur) /
+                           pemisah bahu dan jalur kiri (3 jalur)
+  tepi kanan   (magenta) : tepi kanan jalur kanan (2 jalur) /
+                           pemisah jalur kiri dan jalur kanan (3 jalur)
+
+Warna area:
+  2 jalur : hijau = jalur kiri, merah = jalur kanan
+  3 jalur : kuning = bahu, hijau = jalur kiri, merah = jalur kanan
+  Area di kanan garis tepi kanan hanya diwarnai pada permukaan aspal, bukan rumput.
 
 Alur pemrosesan per frame:
-  Frame -> ROI -> Grayscale -> Gaussian Blur -> Canny
-        -> filter marka (top-hat putih & kuning) -> HoughLinesP
-        -> segmen dikelompokkan menjadi garis marka (menurut posisi di garis acuan)
-        -> peran garis: tepi kiri, garis tengah, tepi bahu, tepi kanan terluar
-        -> jumlah jalur 2 / 3 dengan voting beberapa frame terakhir (atau paksa lewat --jalur)
+  Frame -> ROI -> Grayscale -> Gaussian Blur -> Canny (hanya pada area marka)
+        -> filter marka putih/kuning (kontras dua sisi) -> HoughLinesP
+        -> segmen dikelompokkan menjadi garis marka
+        -> peran garis: tepi kiri, garis tengah, tepi kanan (sesuai posisi terhadap tengah)
         -> fit kurva (parabola) -> uji kewajaran -> EMA -> Kalman per titik
-        -> fallback: lebar jalur + sisi lain, prediksi Kalman, lalu dinyatakan hilang
-        -> gambar: tiap bagian punya warna sendiri
-
-Warna pada gambar:
-  2 jalur : hijau = jalur kiri (dideteksi), merah = jalur berlawanan
-  3 jalur : oranye = bahu jalan (kiri garis biru; diperkirakan bila garis bahu tidak terlihat)
-            hijau = jalur kiri (antara garis biru dan kuning)
-            merah = jalur berlawanan (kanan garis kuning)
-  Garis   : biru = tepi kiri jalur kiri, kuning = garis tengah, magenta = tepi kanan terluar
-  Titik   : angka x,y (piksel frame yang diproses) di setiap garis; tombol c = tampil/sembunyi
+        -> fallback: lebar jalur dari sisi lain, prediksi Kalman, lalu dinyatakan hilang
+        -> rasio aspal di kanan garis tepi kanan -> jumlah jalur (voting + histeresis)
+        -> gambar area, garis, label, titik x,y, dan legenda
 
 Cara pakai:
-  python deteksi_jalur_kiri.py                                  (memakai video_jalan.mp4)
+  python deteksi_jalur_kiri.py
   python deteksi_jalur_kiri.py --source video_jalan.mp4 --save hasil.mp4 --tanpa-tampil
-  python deteksi_jalur_kiri.py --source video_jalan.mp4 --mulai 30 --durasi 20 --save potongan.mp4
-  python deteksi_jalur_kiri.py --source video_jalan.mp4 --jalur 3
-  python deteksi_jalur_kiri.py --source 0                       (webcam)
+  python deteksi_jalur_kiri.py --source video_jalan.mp4 --mulai 40 --durasi 12 --save pesisir.mp4
+  python deteksi_jalur_kiri.py --source video_jalan.mp4 --jalur 2 --koordinat koordinat.jsonl
+  python deteksi_jalur_kiri.py --source video_jalan.mp4 --tampil-roi
+  python deteksi_jalur_kiri.py --source 0                     (webcam)
   python deteksi_jalur_kiri.py --source foto.jpg --save hasil.jpg
 
 Tombol saat jendela tampil:
-  q = keluar | d = debug | c = titik koordinat on/off | a = jumlah jalur otomatis
-  2 = paksa 2 jalur | 3 = paksa 3 jalur
+  q = keluar           | d = mode debug (titik kandidat marka)
+  c = titik x,y on/off | r = garis ROI on/off
+  a = jumlah jalur otomatis | 2 = paksa 2 jalur | 3 = paksa 3 jalur
+
+Kebutuhan: Python 3, opencv-python, numpy.
 """
 
 import argparse
@@ -53,31 +64,31 @@ import numpy as np
 # ============================================================
 #   PARAMETER
 # ============================================================
-LEBAR_PROSES = 640                  # frame diperkecil ke lebar ini sebelum diproses (lebih cepat)
+LEBAR_PROSES = 640                   # frame diperkecil ke lebar ini sebelum diproses
 
-# --- ROI: 40% bagian bawah frame, selebar frame. Garis ROI tidak digambar.
+# --- ROI: 40% bagian bawah frame, selebar frame
 ROI_TINGGI = 0.40
-ROI_ATAS = 1.0 - ROI_TINGGI         # 0.60 = batas atas ROI (proporsi tinggi frame)
+ROI_ATAS = 1.0 - ROI_TINGGI          # 0.60 = batas atas ROI (proporsi tinggi frame)
 
-Y_BAWAH = 0.88                      # garis digambar sampai di sini (kap mobil menutupi di bawahnya)
-Y_REF = 0.80                        # garis acuan: menentukan sisi kiri/kanan dan lebar jalur
-Y_HORIZON = 0.48                    # perkiraan cakrawala, untuk perspektif lebar jalur
-N_TITIK = 9                         # jumlah titik per garis (dari ROI_ATAS ke Y_BAWAH)
+# --- Sumbu acuan dan titik garis
+Y_BAWAH = 0.88                       # garis digambar sampai di sini (kap mobil menutupi di bawahnya)
+Y_REF = 0.80                         # garis acuan: pemisah kiri/kanan dan lebar jalur dihitung di sini
+Y_HORIZON = 0.48                     # perkiraan cakrawala, untuk perspektif lebar jalur
+N_TITIK = 9                          # jumlah titik per garis (dari ROI_ATAS ke Y_BAWAH)
 Y_LEVELS = np.linspace(ROI_ATAS, Y_BAWAH, N_TITIK)
-SKALA_T = 0.30                      # t = (y - Y_REF) / (SKALA_T * tinggi), dipakai saat fitting
+SKALA_T = 0.30                       # t = (y - Y_REF) / (SKALA_T * tinggi), dipakai saat fitting
 
-# --- Pra-pemrosesan (seperti kode referensi: Grayscale -> Gaussian Blur -> Canny)
+# --- Pra-pemrosesan
 BLUR_KSIZE = 5
 CANNY_LOW, CANNY_HIGH = 50, 150
 
-# --- Filter marka jalan (putih dan kuning)
+# --- Filter marka jalan
 #     Marka = garis yang LEBIH TERANG dari KEDUA sisinya (pada jarak MARKA_JARAK_SISI).
-#     Tepi antara area terang dan gelap (tanah, kerikil, rumput) hanya terang di satu sisi,
-#     sehingga tidak lolos. Warna juga dicek: putih / krem, bukan hijau rumput.
-MARKA_JARAK_SISI = 12               # jarak sisi pembanding (pixel pada lebar 640)
-MARKA_KONTRAS = 22                  # selisih kecerahan minimum terhadap kedua sisi
-MARKA_PUTIH_MIN_V = 110             # kecerahan minimum marka putih
-MARKA_KUNING_H = (15, 35)           # rona kuning (skala OpenCV 0-180)
+#     Tepi antara area terang dan gelap (tanah, kerikil, rumput) hanya terang di satu sisi.
+MARKA_JARAK_SISI = 12                # jarak sisi pembanding (pixel pada lebar 640)
+MARKA_KONTRAS = 22                   # selisih kecerahan minimum terhadap kedua sisi
+MARKA_PUTIH_MIN_V = 110              # kecerahan minimum marka putih
+MARKA_KUNING_H = (15, 35)            # rona kuning (skala OpenCV 0-180)
 MARKA_KUNING_S = 90
 MARKA_KUNING_V = 120
 MARKA_DILATE = 7
@@ -86,58 +97,61 @@ MARKA_DILATE = 7
 HOUGH_THRESH = 20
 HOUGH_MIN_LEN = 15
 HOUGH_MAX_GAP = 30
-SLOPE_MIN = 0.35                    # |dy/dx| minimum: garis hampir mendatar dibuang
-SLOPE_MAX = 8.0                     # |dy/dx| maksimum: garis hampir tegak (tiang) dibuang
+SLOPE_MIN = 0.35                     # |dy/dx| minimum: garis hampir mendatar dibuang
+SLOPE_MAX = 8.0                      # |dy/dx| maksimum: garis hampir tegak (tiang) dibuang
 
 # --- Pengelompokan segmen menjadi garis marka
-KELOMPOK_TOL = 0.035                # segmen dengan posisi berdekatan (proporsi lebar) dianggap satu garis
-KELOMPOK_MIN_SPAN = 0.04            # rentang vertikal minimum garis utama (garis putus-putus ikut terbaca)
-KELOMPOK_SPAN_LUAR = 0.10           # rentang minimum garis luar (bahu / tepi kanan): harus garis menerus
-KELOMPOK_TOL_KEMIRING = 0.40        # selisih kemiringan (dx/dy) segmen dengan garis yang dimasuki
-                                    # (cukup longgar agar garis melengkung di tikungan tetap menyatu)
-GATE_TOL = 0.06                     # kandidat dicocokkan ke garis lama bila selisihnya di bawah ini (proporsi lebar)
-BAHU_MIN_JARAK = 0.06               # garis bahu harus berjarak minimal ini dari tepi kiri (proporsi lebar)
-JARAK_PINDAH = 0.10                 # garis yang dilacak pindah ke garis kuat yang lebih dekat ke tengah
-                                    # bila selisihnya lebih dari ini (mencegah penguncian ke tepi jalan)
-BAHU_LEBAR_RASIO = 0.60             # mode 3: bila garis bahu tidak terlihat, lebar bahu = rasio x lebar jalur
+KELOMPOK_TOL = 0.035                 # segmen berdekatan (proporsi lebar) dianggap satu garis
+KELOMPOK_MIN_SPAN = 0.04             # rentang vertikal minimum garis (garis putus-putus ikut terbaca)
+KELOMPOK_SPAN_LUAR = 0.10            # rentang minimum garis luar (tepi kanan): harus garis menerus
+KELOMPOK_TOL_KEMIRING = 0.40         # selisih kemiringan (dx/dy) segmen dengan garis yang dimasuki
+GATE_TOL = 0.06                      # kandidat dicocokkan ke garis lama bila selisihnya di bawah ini
+JARAK_MIN_GARIS_LUAR = 0.06          # tepi kanan harus berjarak minimal ini dari garis tengah (proporsi lebar)
+JARAK_PINDAH = 0.10                  # garis yang dilacak pindah ke garis kuat yang lebih dekat ke tengah
 
 # --- Fit kurva & penghalusan
 FIT_MIN_TITIK = 8
-FIT_MIN_SPAN = 0.10                 # rentang vertikal minimum (proporsi tinggi) untuk memakai parabola
-CURVE_MAX = 0.15                    # kelengkungan maksimum (proporsi lebar)
-EMA_ALPHA = 0.15                    # EMA parameter kurva
-WAJAR_TOL = 0.04                    # kurva baru harus dekat kurva lama (proporsi lebar)
-RELOCK_FRAMES = 8                   # garis baru yang konsisten selama sekian frame menggantikan yang lama
-MAX_HILANG = 40                     # frame tanpa deteksi sebelum garis dinyatakan hilang
+FIT_MIN_SPAN = 0.10                  # rentang vertikal minimum (proporsi tinggi) untuk memakai parabola
+CURVE_MAX = 0.15                     # kelengkungan maksimum (proporsi lebar)
+EMA_ALPHA = 0.15                     # EMA parameter kurva
+WAJAR_TOL = 0.04                     # kurva baru harus dekat kurva lama (proporsi lebar)
+RELOCK_FRAMES = 8                    # garis baru yang konsisten selama sekian frame menggantikan yang lama
+MAX_HILANG = 40                      # frame tanpa deteksi sebelum garis dinyatakan hilang
 
 # --- Kalman filter (per titik level y)
 KF_Q_POS = 0.0008
 KF_Q_VEL = 0.0001
 KF_VEL_DECAY = 0.90
-KF_R_DETEKSI = 0.006                # derau ukur saat garis terdeteksi langsung (proporsi lebar)
-KF_R_TURUNAN = 0.012                # derau ukur saat garis diturunkan dari sisi lain
+KF_R_DETEKSI = 0.006                 # derau ukur saat garis terdeteksi langsung (proporsi lebar)
+KF_R_TURUNAN = 0.012                 # derau ukur saat garis diturunkan dari sisi lain
 KF_GATE = 3.0
 
-# --- Lebar jalur (dipelajari otomatis dari frame yang kedua garisnya terlihat)
-LEBAR_DEFAULT = 0.40                # tebakan awal (proporsi lebar gambar pada garis acuan)
+# --- Lebar jalur (dipelajari dari frame yang kedua garisnya terlihat, pada mode 2 jalur)
+LEBAR_DEFAULT = 0.40                 # tebakan awal (proporsi lebar gambar pada garis acuan)
 LEBAR_ALPHA = 0.05
 
 # --- Jumlah jalur
-VOTE_FRAMES = 120                   # jumlah frame (~2 detik di 60 fps) untuk voting 2 / 3 jalur
-VOTE_NAIK = 0.70                    # pindah ke 3 jalur bila >= 70% frame terakhir mendukung 3 jalur
-VOTE_TURUN = 0.30                   # kembali ke 2 jalur bila <= 30% (histeresis: tidak berkedip)
+VOTE_FRAMES = 120                    # frame (~2 detik di 60 fps) untuk voting 2 / 3 jalur
+VOTE_NAIK = 0.70                     # pindah ke 3 jalur bila >= 70% frame terakhir mendukung
+VOTE_TURUN = 0.30                    # kembali ke 2 jalur bila <= 30% (histeresis)
+ASPAL_KANAN_MIN = 0.50               # bukti 3 jalur bila rasio aspal di kanan tepi kanan >= nilai ini
+ASPAL_V_MAKS = 165                   # aspal lebih gelap dari kerikil terang
 
 # --- Warna (format BGR)
-WARNA_JALUR_KIRI = (0, 200, 0)      # hijau: jalur kiri (yang dideteksi)
-WARNA_TEPI_KIRI = (255, 0, 0)       # biru: garis tepi jalur kiri
-WARNA_TENGAH = (0, 255, 255)        # kuning: garis tengah
-WARNA_BAHU = (0, 140, 255)          # oranye: bahu jalan (hanya 3 jalur)
-WARNA_BERLAWANAN = (0, 0, 255)      # merah: jalur berlawanan
-WARNA_TEPI_KANAN = (255, 0, 255)    # magenta: tepi kanan terluar
-WARNA_KANDIDAT = (160, 160, 160)    # abu-abu: titik kandidat (mode debug)
+#     2 jalur: hijau = jalur kiri, merah = jalur kanan
+WARNA_JALUR_KIRI = (0, 200, 0)
+WARNA_JALUR_KANAN = (0, 0, 255)
+#     3 jalur: kuning = bahu, hijau = jalur kiri, merah = jalur kanan
+WARNA_BAHU = (0, 255, 255)
+#     Garis (sama untuk kedua mode)
+WARNA_TEPI_KIRI = (255, 0, 0)        # biru
+WARNA_TENGAH = (0, 255, 255)         # kuning
+WARNA_TEPI_KANAN = (255, 0, 255)     # magenta
+WARNA_ROI = (255, 255, 0)            # cyan: garis ROI (bila ditampilkan)
+WARNA_KANDIDAT = (160, 160, 160)     # abu-abu: titik kandidat (mode debug)
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
-JUDUL = "Deteksi Jalur Kiri"
+JUDUL = "Deteksi Jalur"
 
 
 # ============================================================
@@ -226,7 +240,7 @@ class KalmanTitik:
             self.aktif = True
             return self.x.copy()
 
-        # --- prediksi
+        # prediksi
         qx = (KF_Q_POS * w) ** 2
         qv = (KF_Q_VEL * w) ** 2
         d = KF_VEL_DECAY
@@ -236,7 +250,7 @@ class KalmanTitik:
         p01 = d * (self.p01 + self.p11)
         p11 = d * d * self.p11 + qv
 
-        # --- koreksi dengan ukuran (penjaga loncatan: ukuran aneh -> derau diperbesar)
+        # koreksi dengan ukuran (penjaga loncatan: ukuran aneh -> derau diperbesar)
         if z is not None:
             r = np.asarray(r_std, dtype=np.float64) ** 2
             y = np.asarray(z, dtype=np.float64) - x
@@ -254,15 +268,24 @@ class KalmanTitik:
         return self.x.copy()
 
 
+def langkah_kf(garis, z, st, w, n):
+    """Jalankan Kalman untuk satu garis. Mengembalikan dict {x, status}.
+    z = None -> prediksi saja (status 'estimasi'); bila Kalman belum aktif -> 'hilang'."""
+    if z is None:
+        x = garis.kf.langkah(None, None, w)
+        return {"x": x, "status": "estimasi"} if x is not None else {"x": None, "status": "hilang"}
+    r = np.full(n, (KF_R_TURUNAN if st == "turunan" else KF_R_DETEKSI) * w)
+    return {"x": garis.kf.langkah(z, r, w), "status": st}
+
+
 # ============================================================
 #   GARIS YANG DILACAK ANTAR-FRAME
 # ============================================================
 class Garis:
-    """Satu garis (tepi kiri, garis tengah, bahu, atau tepi kanan) yang dilacak antar-frame.
+    """Satu garis (tepi kiri, garis tengah, atau tepi kanan) yang dilacak antar-frame.
     Berisi kurva aktif, penghitung frame tanpa deteksi, dan Kalman filter untuk titik-titiknya."""
 
-    def __init__(self, nama):
-        self.nama = nama
+    def __init__(self):
         self.kf = KalmanTitik()
         self.reset()
 
@@ -298,7 +321,7 @@ class Garis:
             self._ganti(theta, dom)
             return
         if not self._wajar(theta, dom, w, h):
-            # Dianggap pencilan sesaat. Diterima hanya bila konsisten selama RELOCK_FRAMES.
+            # dianggap pencilan sesaat; diterima hanya bila konsisten selama RELOCK_FRAMES
             self.tolak += 1
             if self.tolak >= RELOCK_FRAMES:
                 self._ganti(theta, dom)
@@ -351,9 +374,9 @@ def mask_marka(roi, w):
 
 
 def deteksi_kandidat(roi, y0, w, h):
-    """Cari garis marka di dalam ROI.
-    Mengembalikan daftar kandidat garis, masing-masing berisi posisi di garis acuan (xref),
-    panjang total, dan titik-titik untuk fitting. Koordinat sudah dalam frame penuh."""
+    """Cari garis marka di dalam ROI. Mengembalikan daftar kandidat, masing-masing berisi
+    posisi di garis acuan (xref), rentang vertikal (span), dan titik-titik untuk fitting.
+    Koordinat sudah dalam frame penuh."""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (BLUR_KSIZE, BLUR_KSIZE), 0)
     edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
@@ -386,10 +409,9 @@ def deteksi_kandidat(roi, y0, w, h):
                        np.linspace(x1, x2, n), np.linspace(y1, y2, n)))
 
     # kelompokkan segmen secara berurutan: segmen masuk ke garis terdekat bila posisinya
-    # (di titik tengah segmen) dan kemiringannya cocok dengan garis itu. Cara ini mengikuti
-    # garis yang melengkung, tidak seperti pengelompokan berdasarkan titik ekstrapolasi.
+    # (di titik tengah segmen) dan kemiringannya cocok. Cara ini mengikuti garis melengkung.
     segmen.sort(key=lambda s: -s[1])                       # segmen terpanjang dulu sebagai awal
-    grup = []                                              # tiap grup: daftar segmen + titik (x, y, dx/dy)
+    grup = []                                              # tiap grup: segmen + titik (x, y, dx/dy)
     for s in segmen:
         xref_s, panjang_s, k_s, sx, sy = s
         xm = 0.5 * (sx[0] + sx[-1])
@@ -430,7 +452,7 @@ def pilih_kandidat(daftar, garis, w, h, dari_tengah):
     - Bila garis sudah ada dan ada garis KUAT (menerus) yang jauh lebih dekat ke tengah
       daripada garis yang dilacak, pindah ke garis itu. Ini mencegah penguncian ke tepi jalan.
     - Selain itu: kandidat terdekat ke prediksi garis, asal masih dalam GATE_TOL.
-    dari_tengah = True bila garis berada di sisi kanan (garis yang lebih dekat tengah = xref lebih kecil)."""
+    dari_tengah = True bila garis berada di sisi kanan (yang lebih dekat tengah = xref lebih kecil)."""
     if not daftar:
         return None
     if garis.theta is None:
@@ -443,7 +465,7 @@ def pilih_kandidat(daftar, garis, w, h, dari_tengah):
     else:
         dekat = [c for c in kuat if c["xref"] > pred + jarak_pindah]
     if dekat:
-        return dekat[0]                                  # daftar terurut: yang paling dekat tengah
+        return dekat[0]
     terdekat = min(daftar, key=lambda c: abs(c["xref"] - pred))
     return terdekat if abs(terdekat["xref"] - pred) <= GATE_TOL * w else None
 
@@ -455,16 +477,15 @@ def fit_kandidat(c, w, h):
 
 
 # ============================================================
-#   JUMLAH JALUR, LEBAR JALUR, DAN KOORDINAT FINAL
+#   KEADAAN PELACAK, JUMLAH JALUR, LEBAR JALUR
 # ============================================================
 class Pelacak:
-    """Seluruh keadaan yang dibawa dari frame ke frame."""
+    """Seluruh keadaan yang dibawa dari frame ke frame, dan pengaturan tampilan."""
 
     def __init__(self, jalur="auto"):
-        self.tepi_kiri = Garis("tepi_kiri")
-        self.tengah = Garis("tengah")
-        self.bahu = Garis("bahu")
-        self.tepi_kanan = Garis("tepi_kanan")
+        self.tepi_kiri = Garis()
+        self.tengah = Garis()
+        self.tepi_kanan = Garis()
         self.lebar_prop = LEBAR_DEFAULT
         self.lebar_n = 0
         self.jalur = jalur                  # "auto", "2", atau "3"
@@ -472,16 +493,17 @@ class Pelacak:
         self.mode = 2
         self.frame = 0
         self.tampil_koordinat = True        # titik x,y di gambar (tombol c)
+        self.tampil_roi = False             # garis ROI di gambar (tombol r); tersembunyi secara default
 
 
-def tentukan_mode(p, ada_bahu):
-    """Jumlah jalur: 3 bila garis bahu terlihat secara konsisten (di kiri tepi jalur kiri),
-    selain itu 2. Voting beberapa frame + histeresis (VOTE_NAIK / VOTE_TURUN) agar mode tidak
-    berkedip oleh gangguan sesaat. --jalur 2 atau 3 memaksa mode."""
+def tentukan_mode(p, bukti_3_jalur):
+    """Jumlah jalur: 3 bila bukti 3 jalur konsisten selama beberapa frame, selain itu 2.
+    Voting dengan histeresis (VOTE_NAIK / VOTE_TURUN) agar mode tidak berkedip.
+    --jalur 2 atau 3 memaksa mode."""
     if p.jalur in ("2", "3"):
         p.mode = int(p.jalur)
         return p.mode
-    p.vote.append(1 if ada_bahu else 0)
+    p.vote.append(1 if bukti_3_jalur else 0)
     frac = sum(p.vote) / len(p.vote)
     if p.mode == 2 and frac >= VOTE_NAIK:
         p.mode = 3
@@ -508,26 +530,16 @@ def pelajari_lebar(p, w, h):
         p.lebar_prop = (1 - a) * p.lebar_prop + a * prop
 
 
-def langkah_kf(garis, z, st, w, n):
-    """Jalankan Kalman untuk satu garis. Mengembalikan dict {x, status}.
-    z = None -> prediksi saja (status 'estimasi'); bila Kalman belum aktif -> 'hilang'."""
-    if z is None:
-        x = garis.kf.langkah(None, None, w)
-        return {"x": x, "status": "estimasi"} if x is not None else {"x": None, "status": "hilang"}
-    r = np.full(n, (KF_R_TURUNAN if st == "turunan" else KF_R_DETEKSI) * w)
-    return {"x": garis.kf.langkah(z, r, w), "status": st}
-
-
 def hitung_koordinat(p, w, h):
     """Koordinat final tiap garis untuk frame ini.
-      - tepi kiri & garis tengah saling mengisi bila salah satunya tidak terlihat
+      - tepi kiri dan garis tengah saling mengisi bila salah satunya tidak terlihat
         (garis yang hilang = garis lain +/- lebar jalur, status 'turunan')
-      - bahu dan tepi kanan hanya dari deteksi, lalu diprediksi Kalman sebentar bila hilang
+      - tepi kanan hanya dari deteksi, lalu diprediksi Kalman sebentar bila hilang
     Setiap garis dihaluskan dengan Kalman filter."""
     lv = Y_LEVELS * h
     n = len(lv)
     lebar = lebar_px(lv, h, w, p)
-    kiri, tengah, bahu, luar = p.tepi_kiri, p.tengah, p.bahu, p.tepi_kanan
+    kiri, tengah, luar = p.tepi_kiri, p.tengah, p.tepi_kanan
 
     if kiri.segar:
         z_k, st_k = kiri.x_pada(lv, h), "deteksi"
@@ -543,20 +555,11 @@ def hitung_koordinat(p, w, h):
     else:
         z_t, st_t = None, "estimasi"
 
-    # garis bahu: dari deteksi bila terlihat; bila tidak (mode 3), diperkirakan dari tepi kiri
-    # jalur kiri dengan lebar BAHU_LEBAR_RASIO x lebar jalur (status 'turunan')
-    if bahu.segar:
-        z_b, st_b = bahu.x_pada(lv, h), "deteksi"
-    elif p.mode == 3 and z_k is not None:
-        z_b, st_b = z_k - BAHU_LEBAR_RASIO * lebar, "turunan"
-    else:
-        z_b, st_b = None, "estimasi"
     z_r = luar.x_pada(lv, h) if luar.segar else None
 
     garis = {
         "tepi_kiri": langkah_kf(kiri, z_k, st_k, w, n),
         "tengah": langkah_kf(tengah, z_t, st_t, w, n),
-        "bahu": langkah_kf(bahu, z_b, st_b, w, n),
         "tepi_kanan": langkah_kf(luar, z_r, "deteksi", w, n),
     }
 
@@ -567,11 +570,50 @@ def hitung_koordinat(p, w, h):
         status = "hilang"
     else:
         status = "perkiraan"
-    return {"garis": garis, "lebar": lebar, "y": lv, "status": status, "mode": p.mode}
+    return {"garis": garis, "lebar": lebar, "y": lv, "status": status}
 
 
+# ============================================================
+#   ASPAL DI KANAN GARIS TEPI KANAN (PENENTU 2 / 3 JALUR)
+# ============================================================
+def mask_aspal_frame(frame):
+    """Piksel permukaan aspal: saturasi rendah dan kecerahan sedang. Rumput (saturasi tinggi)
+    dan langit tidak lolos; kerikil yang sangat terang juga tidak lolos."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    _, ss, vv = cv2.split(hsv)
+    return (ss <= 70) & (vv >= 60) & (vv <= ASPAL_V_MAKS)
+
+
+def area_kanan_garis(lv, luar_x, h, w):
+    """Mask area di kanan garis tepi kanan, sampai tepi frame, di dalam ROI."""
+    yi = np.round(lv).astype(np.int32)
+    xi = np.clip(np.round(luar_x), -w, 2 * w).astype(np.int32)
+    region = np.zeros((h, w), np.uint8)
+    poly = np.vstack([np.stack([xi, yi], axis=1),
+                      np.stack([np.full(len(lv), w - 1, dtype=np.int32), yi], axis=1)[::-1]])
+    cv2.fillPoly(region, [poly], 1)
+    return region > 0
+
+
+def rasio_aspal_kanan(frame, luar_x, lv):
+    """Bagian area di kanan garis tepi kanan (sampai tepi frame, di dalam ROI) yang berupa
+    aspal, 0-1. Jalan 3 jalur: di kanan garis magenta masih ada jalur aspal.
+    Jalan 2 jalur: di kanan garis tepi kanan biasanya rumput atau tanah."""
+    if luar_x is None:
+        return 0.0
+    h, w = frame.shape[:2]
+    region = area_kanan_garis(lv, luar_x, h, w)
+    total = int(region.sum())
+    if total < 50:
+        return 0.0
+    return float((mask_aspal_frame(frame) & region).sum()) / total
+
+
+# ============================================================
+#   ANALISIS SATU FRAME
+# ============================================================
 def analisis(frame, p, debug=False):
-    """Satu frame: deteksi, pelacakan, lalu koordinat final. Mengembalikan dict hasil."""
+    """Satu frame: deteksi garis, pelacakan, koordinat final, lalu jumlah jalur."""
     h, w = frame.shape[:2]
     p.frame += 1
     y0 = int(round(ROI_ATAS * h))
@@ -583,25 +625,26 @@ def analisis(frame, p, debug=False):
     c_kiri = pilih_kandidat(kiri_list, p.tepi_kiri, w, h, dari_tengah=False)
     c_tengah = pilih_kandidat(kanan_list, p.tengah, w, h, dari_tengah=True)
 
-    # garis luar (bahu dan tepi kanan terluar) harus menerus dan berjarak dari garis utama
-    jarak = BAHU_MIN_JARAK * w
-    kandidat_bahu = [c for c in kiri_list if c_kiri is not None
-                     and c["xref"] < c_kiri["xref"] - jarak and c["span"] >= KELOMPOK_SPAN_LUAR]
+    # tepi kanan harus menerus dan berjarak dari garis tengah
+    jarak = JARAK_MIN_GARIS_LUAR * w
     kandidat_luar = [c for c in kanan_list if c_tengah is not None
                      and c["xref"] > c_tengah["xref"] + jarak and c["span"] >= KELOMPOK_SPAN_LUAR]
-    c_bahu = pilih_kandidat(kandidat_bahu, p.bahu, w, h, dari_tengah=False)
     c_luar = pilih_kandidat(kandidat_luar, p.tepi_kanan, w, h, dari_tengah=True)
 
-    tentukan_mode(p, c_bahu is not None)
-
-    for garis, c in ((p.tepi_kiri, c_kiri), (p.tengah, c_tengah),
-                     (p.bahu, c_bahu), (p.tepi_kanan, c_luar)):
+    for garis, c in ((p.tepi_kiri, c_kiri), (p.tengah, c_tengah), (p.tepi_kanan, c_luar)):
         garis.update(fit_kandidat(c, w, h), w, h)
 
-    if p.tepi_kiri.segar and p.tengah.segar:
+    if p.tepi_kiri.segar and p.tengah.segar and p.mode == 2:
         pelajari_lebar(p, w, h)
 
     hasil = hitung_koordinat(p, w, h)
+
+    # jumlah jalur: 3 bila di kanan garis tepi kanan masih ada aspal
+    rasio = rasio_aspal_kanan(frame, hasil["garis"]["tepi_kanan"]["x"], hasil["y"])
+    tentukan_mode(p, rasio >= ASPAL_KANAN_MIN)
+
+    hasil["mode"] = p.mode
+    hasil["rasio_aspal"] = rasio
     hasil["frame"] = p.frame
     if debug:
         hasil["kandidat"] = [(c["xref"], Y_REF * h) for c in kand]
@@ -619,7 +662,7 @@ def tulis_teks(img, teks, org, fs, warna, tebal=2):
 
 
 def tulis_label(img, teks, x, y, s):
-    """Label di tengah (x, y), teks putih dengan garis tepi gelap, tetap di dalam gambar."""
+    """Nama bagian jalan: teks putih di tengah (x, y), tetap di dalam gambar."""
     h, w = img.shape[:2]
     fs = 0.5 * s
     (tw, th), _ = cv2.getTextSize(teks, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
@@ -652,13 +695,19 @@ def gambar_titik(img, daftar, lv, s):
 
 def gambar_legenda(img, mode, s):
     """Keterangan warna di pojok kiri atas, sesuai jumlah jalur."""
-    items = [("Jalur kiri (dideteksi)", WARNA_JALUR_KIRI),
-             ("Tepi jalur kiri", WARNA_TEPI_KIRI),
-             ("Garis tengah", WARNA_TENGAH)]
     if mode == 3:
-        items.append(("Bahu jalan", WARNA_BAHU))
-    items += [("Jalur berlawanan", WARNA_BERLAWANAN),
-              ("Tepi kanan terluar", WARNA_TEPI_KANAN)]
+        items = [("Bahu jalan (kuning)", WARNA_BAHU),
+                 ("Jalur kiri (hijau)", WARNA_JALUR_KIRI),
+                 ("Jalur kanan (merah)", WARNA_JALUR_KANAN),
+                 ("Tepi bahu (biru)", WARNA_TEPI_KIRI),
+                 ("Garis kuning: bahu | jalur kiri", WARNA_TENGAH),
+                 ("Garis magenta: jalur kiri | kanan", WARNA_TEPI_KANAN)]
+    else:
+        items = [("Jalur kiri (hijau)", WARNA_JALUR_KIRI),
+                 ("Tepi jalur kiri (biru)", WARNA_TEPI_KIRI),
+                 ("Garis tengah (kuning)", WARNA_TENGAH),
+                 ("Jalur kanan (merah)", WARNA_JALUR_KANAN),
+                 ("Tepi kanan (magenta)", WARNA_TEPI_KANAN)]
     kotak = max(7, int(round(10 * s)))
     x = int(8 * s)
     for k, (teks, warna) in enumerate(items):
@@ -669,7 +718,8 @@ def gambar_legenda(img, mode, s):
 
 
 def gambar(frame, hasil, p, debug=False):
-    """Gambar area dan garis sesuai jumlah jalur, plus titik koordinat (bila aktif)."""
+    """Gambar area, garis, label, titik x,y, garis ROI (bila aktif), dan legenda.
+    Area di kanan garis tepi kanan hanya diwarnai pada permukaan aspal, bukan rumput."""
     h, w = frame.shape[:2]
     s = w / 640.0
     out = frame.copy()
@@ -678,22 +728,30 @@ def gambar(frame, hasil, p, debug=False):
     mode = hasil["mode"]
     G = {k: v["x"] for k, v in hasil["garis"].items()}
     lebar = hasil["lebar"]
-    kiri, tengah = G["tepi_kiri"], G["tengah"]
-    bahu, luar = G["bahu"], G["tepi_kanan"]
+    kiri, tengah, luar = G["tepi_kiri"], G["tengah"], G["tepi_kanan"]
     batas_kanan = luar if luar is not None else (tengah + lebar if tengah is not None else None)
+    kk = N_TITIK - 1
+    k2 = max(0, kk - 2)
+    yl = 0.94 * h
 
     def pts(x):
         xi = np.clip(np.round(x), -w, 2 * w).astype(np.int32)
         return np.stack([xi, yi], axis=1)
 
-    # 1) area berwarna (dicampur transparan dengan gambar asli)
+    # 1) area berwarna
     ov = np.zeros_like(out)
-    if kiri is not None and tengah is not None:
-        cv2.fillPoly(ov, [np.vstack([pts(kiri), pts(tengah)[::-1]])], WARNA_JALUR_KIRI)
-    if mode == 3 and bahu is not None and kiri is not None:
-        cv2.fillPoly(ov, [np.vstack([pts(bahu), pts(kiri)[::-1]])], WARNA_BAHU)
-    if tengah is not None:
-        cv2.fillPoly(ov, [np.vstack([pts(tengah), pts(batas_kanan)[::-1]])], WARNA_BERLAWANAN)
+    if mode == 3:
+        if kiri is not None and tengah is not None:                 # bahu
+            cv2.fillPoly(ov, [np.vstack([pts(kiri), pts(tengah)[::-1]])], WARNA_BAHU)
+        if tengah is not None:                                      # jalur kiri
+            cv2.fillPoly(ov, [np.vstack([pts(tengah), pts(batas_kanan)[::-1]])], WARNA_JALUR_KIRI)
+    else:
+        if kiri is not None and tengah is not None:                 # jalur kiri
+            cv2.fillPoly(ov, [np.vstack([pts(kiri), pts(tengah)[::-1]])], WARNA_JALUR_KIRI)
+        if tengah is not None:                                      # jalur kanan
+            cv2.fillPoly(ov, [np.vstack([pts(tengah), pts(batas_kanan)[::-1]])], WARNA_JALUR_KANAN)
+    if luar is not None:                                            # jalur kanan di kanan tepi kanan
+        ov[area_kanan_garis(lv, luar, h, w) & mask_aspal_frame(frame)] = WARNA_JALUR_KANAN
     m = ov.any(axis=2)
     out[m] = (0.62 * out[m] + 0.38 * ov[m]).astype(np.uint8)
 
@@ -701,34 +759,44 @@ def gambar(frame, hasil, p, debug=False):
     tebal = max(2, int(round(w / 200)))
     for x, warna, t in ((kiri, WARNA_TEPI_KIRI, tebal + 1),
                         (tengah, WARNA_TENGAH, tebal + 1),
-                        (bahu if mode == 3 else None, WARNA_BAHU, tebal),
                         (luar, WARNA_TEPI_KANAN, tebal)):
         if x is not None:
             cv2.polylines(out, [pts(x)], False, warna, t, cv2.LINE_AA)
 
-    # 3) nama bagian jalan: satu baris di bawah ROI, di atas kap mobil (tidak menumpuk titik x,y)
-    kk = N_TITIK - 1
-    yl = 0.94 * h
-    if kiri is not None and tengah is not None:
-        tulis_label(out, "JALUR KIRI", (kiri[kk] + tengah[kk]) / 2, yl, s)
-    if mode == 3 and bahu is not None and kiri is not None:
-        tulis_label(out, "BAHU", (bahu[kk] + kiri[kk]) / 2, yl, s)
-    if tengah is not None:
-        tulis_label(out, "JALUR BERLAWANAN", (tengah[kk] + batas_kanan[kk]) / 2, yl, s)
+    # 3) garis ROI (hanya bila ditampilkan)
+    if p.tampil_roi:
+        y0 = int(round(ROI_ATAS * h))
+        cv2.rectangle(out, (0, y0), (w - 1, h - 1), WARNA_ROI, 1, cv2.LINE_AA)
+        persen = 100.0 * (h - y0) / h
+        teks = f"ROI 40% bawah: y={y0}..{h} ({h - y0} dari {h} px = {persen:.0f}%)"
+        tulis_teks(out, teks, (int(6 * s), h - int(6 * s)), 0.36 * s, WARNA_ROI, 1)
 
-    # 4) titik koordinat x,y
+    # 4) nama bagian jalan (tidak menumpuk titik x,y)
+    if mode == 3:
+        if kiri is not None and tengah is not None:
+            tulis_label(out, "BAHU", (kiri[kk] + tengah[kk]) / 2, yl, s)
+        if tengah is not None:
+            tulis_label(out, "JALUR KIRI", (tengah[k2] + batas_kanan[k2]) / 2, lv[k2], s)
+        if luar is not None:
+            tulis_label(out, "JALUR KANAN", (luar[kk] + w - 1) / 2, yl, s)
+    else:
+        if kiri is not None and tengah is not None:
+            tulis_label(out, "JALUR KIRI", (kiri[k2] + tengah[k2]) / 2, lv[k2], s)
+        if tengah is not None:
+            tulis_label(out, "JALUR KANAN", (batas_kanan[kk] + w - 1) / 2, yl, s)
+
+    # 5) titik koordinat x,y
     if p.tampil_koordinat:
         gambar_titik(out, [(kiri, WARNA_TEPI_KIRI, -1),
                            (tengah, WARNA_TENGAH, 1),
-                           (bahu if mode == 3 else None, WARNA_BAHU, -1),
                            (luar, WARNA_TEPI_KANAN, 1)], lv, s)
 
-    # 5) mode debug: titik kandidat garis marka
+    # 6) mode debug: titik kandidat garis marka
     if debug and "kandidat" in hasil:
         for x, y in hasil["kandidat"]:
             cv2.circle(out, (int(x), int(y)), max(2, int(round(3 * s))), WARNA_KANDIDAT, -1)
 
-    # 6) status dan legenda
+    # 7) status dan legenda
     sumber = "otomatis" if p.jalur == "auto" else "manual"
     tulis_teks(out, f"Jalur: {mode} ({sumber})  |  Status: {hasil['status']}",
                (int(8 * s), int(22 * s)), 0.5 * s, (255, 255, 255))
@@ -740,10 +808,10 @@ def gambar(frame, hasil, p, debug=False):
 #   KOORDINAT (JSON)
 # ============================================================
 def ke_json(hasil, waktu):
-    """Ubah hasil menjadi objek JSON (titik tiap garis dalam pixel)."""
+    """Hasil satu frame sebagai objek JSON. Titik dalam pixel frame yang diproses."""
     garis_json = {}
     for nama, info in hasil["garis"].items():
-        if info["x"] is None or (nama == "bahu" and hasil["mode"] != 3):
+        if info["x"] is None:
             garis_json[nama] = None
             continue
         garis_json[nama] = {
@@ -752,11 +820,12 @@ def ke_json(hasil, waktu):
                       for x, y in zip(info["x"], hasil["y"])],
         }
     return {"frame": hasil["frame"], "waktu": round(waktu, 3), "jumlah_jalur": hasil["mode"],
+            "rasio_aspal_kanan": round(hasil["rasio_aspal"], 3),
             "status": hasil["status"], "garis": garis_json}
 
 
 # ============================================================
-#   MASUKAN (FOTO / VIDEO / WEBCAM)
+#   MASUKAN: FOTO, VIDEO, DAN WEBCAM
 # ============================================================
 def ubah_lebar(frame, lebar):
     h0, w0 = frame.shape[:2]
@@ -766,7 +835,7 @@ def ubah_lebar(frame, lebar):
 
 
 def proses_foto(path, args, p):
-    """Foto tunggal: diproses berulang agar tracker stabil lalu ditampilkan / disimpan."""
+    """Foto tunggal: diproses berulang agar pelacak stabil, lalu ditampilkan / disimpan."""
     frame = cv2.imread(path)
     if frame is None:
         print("Tidak bisa membuka foto:", path)
@@ -775,10 +844,11 @@ def proses_foto(path, args, p):
     for _ in range(15):
         hasil = analisis(frame, p, args.debug)
     out = gambar(frame, hasil, p, args.debug)
-    print(json.dumps(ke_json(hasil, 0.0), ensure_ascii=False))
+    data = ke_json(hasil, 0.0)
+    print(json.dumps(data, ensure_ascii=False))
     if args.koordinat:
         with open(args.koordinat, "w", encoding="utf-8") as f:
-            f.write(json.dumps(ke_json(hasil, 0.0), ensure_ascii=False) + "\n")
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
     if args.save:
         cv2.imwrite(args.save, out)
         print("Tersimpan:", args.save)
@@ -801,7 +871,8 @@ def proses_video(args, p):
     if not (1.0 < fps <= 240.0):
         fps = 30.0
 
-    # --mulai: lompat ke posisi dan proses 2 detik sebelumnya dulu (tanpa disimpan) agar tracker stabil
+    # --mulai: lompat ke posisi, dan proses 2 detik sebelumnya dulu (tanpa disimpan)
+    # agar pelacak sudah stabil saat bagian yang diminta mulai tampil
     mulai_pem, n_pemanasan = 0.0, 0
     if args.mulai > 0 and not is_cam:
         mulai_pem = max(0.0, args.mulai - 2.0)
@@ -819,8 +890,6 @@ def proses_video(args, p):
     n_mode = {2: 0, 3: 0}
     n_status = {"normal": 0, "perkiraan": 0, "hilang": 0}
     t_mulai = time.perf_counter()
-    hasil = None
-    out = None
 
     while True:
         ok, frame = cap.read()
@@ -862,6 +931,8 @@ def proses_video(args, p):
                 args.debug = not args.debug
             if key == ord("c"):
                 p.tampil_koordinat = not p.tampil_koordinat
+            if key == ord("r"):
+                p.tampil_roi = not p.tampil_roi
             if key == ord("a"):
                 p.jalur = "auto"
             if key == ord("2"):
@@ -886,11 +957,12 @@ def proses_video(args, p):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Deteksi jalur kiri dari video jalan (bahu / jalur kiri / jalur berlawanan).")
+    ap = argparse.ArgumentParser(
+        description="Deteksi jalur dari video jalan (2 jalur: kiri-kanan; 3 jalur: bahu-kiri-kanan).")
     ap.add_argument("--source", default="video_jalan.mp4",
                     help="0 = webcam, path video (mis. video_jalan.mp4), atau path foto")
     ap.add_argument("--jalur", choices=["auto", "2", "3"], default="auto",
-                    help="jumlah jalur: auto (deteksi otomatis), 2, atau 3")
+                    help="jumlah jalur: auto (otomatis), 2, atau 3")
     ap.add_argument("--lebar", type=int, default=LEBAR_PROSES,
                     help="lebar frame yang diproses (default 640)")
     ap.add_argument("--mulai", type=float, default=0.0,
@@ -906,11 +978,14 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="tampilkan titik kandidat garis marka")
     ap.add_argument("--tanpa-koordinat", action="store_true",
-                    help="sembunyikan titik koordinat x,y di gambar (tombol c = tampil/sembunyi)")
+                    help="sembunyikan titik koordinat x,y (tombol c = tampil/sembunyi)")
+    ap.add_argument("--tampil-roi", action="store_true",
+                    help="tampilkan garis ROI (tombol r = tampil/sembunyi; default tersembunyi)")
     args = ap.parse_args()
 
     p = Pelacak(jalur=args.jalur)
     p.tampil_koordinat = not args.tanpa_koordinat
+    p.tampil_roi = args.tampil_roi
     if args.source.lower().endswith(IMAGE_EXT):
         proses_foto(args.source, args, p)
     else:
